@@ -36,6 +36,7 @@ from .store import GroupStore, Transition
 log = logging.getLogger("rlvr_tito.proxy")
 
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8000")
+BASE_MODEL = os.environ.get("MODEL", "")
 GROUP_SIZE = int(os.environ.get("GROUP_SIZE", "8"))
 TRAIN = os.environ.get("TRAIN", "0") == "1"
 
@@ -119,6 +120,8 @@ async def chat_completions(
     body["logprobs"] = True
     if state["adapter"]:
         body["model"] = state["adapter"]
+    elif BASE_MODEL:
+        body["model"] = BASE_MODEL
 
     r = await _client.post("/v1/chat/completions", json=body)
     if r.status_code != 200:
