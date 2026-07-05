@@ -13,11 +13,15 @@ from rlvr_tito.trainer import collate_transitions, flatten_group, _check_parity_
 
 
 def test_group_advantages():
+    # mean-only normalization: no std division
     adv = group_advantages(torch.tensor([1.0, 0.0, 0.0, 1.0]))
     assert torch.allclose(adv.sum(), torch.tensor(0.0), atol=1e-6)
     assert adv[0] > 0 and adv[1] < 0
-    # degenerate group -> all zeros
+    # scale is reward gap, not z-score: winners get +0.5, losers -0.5
+    assert torch.allclose(adv[0], torch.tensor(0.5), atol=1e-6)
+    # degenerate group -> all zeros (no std blowup on low-variance binary groups)
     assert group_advantages(torch.zeros(8)).abs().sum() == 0
+    assert group_advantages(torch.ones(8)).abs().sum() == 0
 
 
 def test_grpo_loss_direction_and_masking():
@@ -81,14 +85,17 @@ def test_collation_alignment():
     assert torch.allclose(blp[1], torch.tensor([0, -0.1, -0.2, -0.3, 0]))
 
 
-def test_collation_left_truncates_prompt_only():
-    tr = Transition(list(range(100)), [7, 8, 9], [-1.0, -1.0, -1.0], 0)
-    batch = collate_transitions([tr], [1.0], pad_token_id=0, max_seq_len=10)
-    ids, mask = batch["input_ids"], batch["response_mask"]
-    assert ids.shape[1] == 10
-    assert ids[0][-3:].tolist() == [7, 8, 9]       # response intact
-    assert mask[0][-3:].tolist() == [1, 1, 1]
-    assert mask[0][:-3].sum() == 0
+def test_collation_skips_overlong_transitions():
+    # Overlong transitions are skipped entirely rather than left-truncated.
+    # Left-truncation removes the system prompt and tool definitions for
+    # multi-turn agents, corrupting the reward signal silently.
+    long_tr = Transition(list(range(100)), [7, 8, 9], [-1.0, -1.0, -1.0], 0)
+    short_tr = Transition([1, 2], [3], [-0.5], 0)
+    batch = collate_transitions([long_tr, short_tr], [1.0, -1.0],
+                                pad_token_id=0, max_seq_len=10)
+    # long_tr (103 tokens) is dropped; only short_tr (3 tokens) survives
+    assert batch["input_ids"].shape[0] == 1
+    assert batch["input_ids"][0][:3].tolist() == [1, 2, 3]
 
 
 def test_transition_rejects_misaligned_logprobs():

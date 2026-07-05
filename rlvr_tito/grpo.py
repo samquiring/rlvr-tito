@@ -4,13 +4,19 @@ Design decisions, made explicit:
 
 - Trajectory-level sparse reward, gamma = 1.0: every response token in every
   transition of a trajectory carries that trajectory's group advantage.
-- Token-mean aggregation across the batch (Dr.GRPO / DAPO style) rather than
+- Token-mean aggregation across the batch (Dr.GRPO style) rather than
   per-sequence mean, to avoid length bias in multi-turn settings.
 - Asymmetric clipping (clip-higher) supported, DAPO-style.
 - Importance ratio is computed against the *behavior* logprobs captured at
   sampling time by vLLM. This is what makes training correct even when the
   serving adapter was updated mid-collection: transitions are mildly
   off-policy and the ratio + clip handles it.
+- Advantage normalization is mean-only (no std division). Dividing by std is
+  numerically unstable for binary rewards: a group of mostly-zero rewards has
+  std ≈ 0, causing advantages to blow up and clip_frac → 1.0 permanently.
+  Mean-only keeps advantage scale proportional to the reward gap and is stable
+  under binary distributions. Watch clip_frac in metrics — sustained values
+  above 0.5 indicate too little within-group reward variance.
 """
 
 from __future__ import annotations
@@ -19,17 +25,19 @@ import torch
 
 
 def group_advantages(rewards: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """Group-relative advantage: z-score of terminal rewards within one
-    group of G rollouts of the same task.
+    """Group-relative advantage: deviation from group mean (mean-only, no std).
 
-    Returns zeros for degenerate groups (all rewards equal); callers should
-    drop those groups before training to avoid wasting a step.
+    Dr.GRPO normalization. Does NOT divide by standard deviation. For binary
+    rewards a low-variance group has std ≈ 0; dividing inflates advantages and
+    causes clip_frac → 1.0 permanently, killing learning. Mean-only keeps the
+    scale of advantages proportional to the reward gap within the group.
+
+    Returns zeros for degenerate groups (all rewards identical).
     """
     r = rewards.to(torch.float32)
-    std = r.std(unbiased=False)
-    if std < eps:
+    if (r - r.mean()).abs().max() < eps:
         return torch.zeros_like(r)
-    return (r - r.mean()) / (std + eps)
+    return r - r.mean()
 
 
 def gather_logprobs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:

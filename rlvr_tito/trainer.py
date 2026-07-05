@@ -62,20 +62,35 @@ class TrainerConfig:
     model_name: str = "Qwen/Qwen3.5-9B-Instruct"
     lora_rank: int = 32
     lora_alpha: int = 64
+    # Qwen3.5 is a hybrid attention/linear-attention model. The attention
+    # projections (q/k/v/o) and MLP projections (gate/up/down) are listed
+    # below. If your variant also has SSM or linear-attention layers, their
+    # projections (commonly in_proj, out_proj, x_proj, dt_proj) are NOT
+    # covered here and LoRA will leave those weights frozen — verify with
+    # `{k for k,_ in model.named_modules() if "proj" in k}` before training.
     lora_target_modules: tuple = (
-        "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+        "in_proj", "out_proj",               # linear/SSM layers in hybrid archs
     )
     lr: float = 1e-6
     clip_low: float = 0.2
     clip_high: float = 0.28
     kl_coef: float = 0.0               # 0 disables ref model entirely
     max_seq_len: int = 32768
+    # DO NOT raise micro_batch_size above 1 for Mamba/hybrid models without
+    # re-running parity_check. Batch padding perturbs Mamba recurrent state
+    # by ~0.1 nats per pad token — enough to corrupt logprob ratios. At mb=1
+    # each forward sees exactly one sequence so collation padding never enters
+    # a forward pass and this issue does not arise.
     micro_batch_size: int = 1
     grad_clip: float = 1.0
     adapter_dir: str = "./adapters"
     vllm_base_url: str = "http://localhost:8000"
     device: str = "cuda"
     dtype: str = "bfloat16"
+    # Keep sdpa. FA2 crashes on hybrid attention (IMMA kernel path is
+    # incompatible) even at sequence length 64. Do not revert to flash_attention_2.
     attn_implementation: str = "sdpa"
     gradient_checkpointing: bool = True
 
@@ -115,17 +130,20 @@ def collate_transitions(
     for tr, adv in zip(transitions, advantages):
         ids = tr.prompt_token_ids + tr.response_token_ids
         if len(ids) > max_seq_len:
-            # Truncate from the LEFT of the prompt: response tokens are the
-            # gradient carriers and must survive intact.
-            overflow = len(ids) - max_seq_len
-            if overflow >= len(tr.prompt_token_ids):
-                log.warning("transition longer than max_seq_len even without "
-                            "prompt; skipping")
-                continue
-            ids = ids[overflow:]
-            prompt_len = len(tr.prompt_token_ids) - overflow
-        else:
-            prompt_len = len(tr.prompt_token_ids)
+            # Skip rather than left-truncate. Left-truncation removes tokens
+            # from the start of the prompt, which for multi-turn agents is the
+            # system message + tool definitions — the text the reward function
+            # was designed against. Silently removing it corrupts the reward
+            # signal in ways that are very hard to debug. Raise max_seq_len
+            # (Qwen3.5 supports up to 128K) or shorten episode max_steps.
+            log.warning(
+                "skipping transition: len=%d > max_seq_len=%d. "
+                "Raise max_seq_len rather than left-truncating — truncation "
+                "removes the system prompt and tool definitions for long episodes.",
+                len(ids), max_seq_len,
+            )
+            continue
+        prompt_len = len(tr.prompt_token_ids)
         mask = [0.0] * prompt_len + [1.0] * len(tr.response_token_ids)
         lp = [0.0] * prompt_len + list(tr.logprobs)
         rows.append(ids)
@@ -288,11 +306,17 @@ class GRPOTrainer:
 
     def push_adapter(self) -> str:
         """Save the LoRA adapter and hot-load it into the running vLLM server.
-        Returns the adapter name the proxy should route to."""
+        Returns the adapter name the proxy should route to.
+
+        self.version is bumped only after the vLLM POST succeeds. If either
+        save_pretrained or the POST fails, self.version is unchanged so the
+        proxy's adapter_version tag stays consistent with what vLLM is actually
+        serving. A partial save is overwritten on the next successful push.
+        """
         import httpx
 
-        self.version += 1
-        name = f"policy_v{self.version}"
+        candidate = self.version + 1
+        name = f"policy_v{candidate}"
         path = os.path.abspath(os.path.join(self.cfg.adapter_dir, name))
         self.model.save_pretrained(path)
         r = httpx.post(
@@ -300,6 +324,7 @@ class GRPOTrainer:
             json={"lora_name": name, "lora_path": path},
             timeout=120,
         )
-        r.raise_for_status()
+        r.raise_for_status()          # raises on failure; version NOT bumped yet
+        self.version = candidate      # commit only after vLLM confirms load
         log.info("loaded %s into vLLM", name)
         return name
