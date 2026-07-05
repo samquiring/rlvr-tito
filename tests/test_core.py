@@ -131,6 +131,48 @@ def test_flatten_group_broadcasts_advantage():
     assert advs[3] == advs[4] < 0
 
 
+def test_microbatch_gradient_equals_full_batch():
+    """Micro-batch accumulated gradient must equal the single-pass full-batch gradient.
+
+    Failure mode caught here: scaling a local token-mean by (local_samples / B)
+    makes the effective per-token weight vary with micro-batch token count, so
+    the accumulated gradient is NOT a token-mean over the full batch.
+    The fix scales each micro-batch by (local_tokens / global_tokens) instead.
+    """
+    torch.manual_seed(42)
+    B, T = 6, 8
+    logp_beh = torch.randn(B, T)
+    adv = torch.tensor([1.0, -1.0, 0.5, -0.5, 0.8, -0.3])
+    # Unequal token counts per row to make the bug visible
+    mask = torch.zeros(B, T)
+    mask[0, :7] = 1  # 7 tokens
+    mask[1, :2] = 1  # 2 tokens
+    mask[2, :5] = 1
+    mask[3, :4] = 1
+    mask[4, :6] = 1
+    mask[5, :1] = 1  # 1 token
+
+    # -- full-batch reference gradient --
+    logp_full = torch.randn(B, T, requires_grad=True)
+    loss_full, _ = grpo_loss(logp_full, logp_beh, adv, mask)
+    loss_full.backward()
+    grad_ref = logp_full.grad.clone()
+
+    # -- micro-batch accumulation with the corrected scaling --
+    logp_mb = logp_full.detach().clone().requires_grad_(True)
+    global_tokens = float(mask.sum().clamp(min=1))
+    mb = 2
+    for i in range(0, B, mb):
+        sl = slice(i, i + mb)
+        loss_mb, _ = grpo_loss(logp_mb[sl], logp_beh[sl], adv[sl], mask[sl])
+        local_tokens = float(mask[sl].sum().clamp(min=1))
+        (loss_mb * (local_tokens / global_tokens)).backward()
+
+    assert torch.allclose(grad_ref, logp_mb.grad, atol=1e-6), (
+        f"max diff {(grad_ref - logp_mb.grad).abs().max():.2e}"
+    )
+
+
 def test_parity_check_passes_within_tolerance():
     _check_parity_match([-1.01, -2.005], [-1.0, -2.0], tol=0.05, idx=0)
 

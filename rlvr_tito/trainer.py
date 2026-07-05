@@ -244,6 +244,14 @@ class GRPOTrainer:
         mb = self.cfg.micro_batch_size
         total_metrics: dict = {}
 
+        # Global token count over the full batch (same causal shift as grpo_loss).
+        # Computed once here so each micro-batch's backward contributes
+        # (local_pg_sum / global_tokens) — a true token-mean over all samples.
+        # Scaling a local token-mean by (local_samples / B) instead would mix
+        # per-token means with sample fractions, making the effective per-token
+        # weight depend on micro-batch size.
+        global_tokens = float(batch["response_mask"][:, 1:].sum().clamp(min=1))
+
         for i in range(0, B, mb):
             sl = slice(i, i + mb)
             ids = batch["input_ids"][sl].to(self.cfg.device)
@@ -263,8 +271,12 @@ class GRPOTrainer:
                 clip_low=self.cfg.clip_low,
                 clip_high=self.cfg.clip_high,
             )
-            (loss * (min(mb, B - i) / B)).backward()
-            total_metrics = m  # last microbatch's metrics; extend as needed
+            # grpo_loss returns a local token-mean; multiply by local token
+            # count to recover the sum, then divide by global_tokens so the
+            # accumulated gradient equals a token-mean over the full batch.
+            local_tokens = float(rmask[:, 1:].sum().clamp(min=1))
+            (loss * (local_tokens / global_tokens)).backward()
+            total_metrics = m
 
         torch.nn.utils.clip_grad_norm_(
             (p for p in self.model.parameters() if p.requires_grad),
