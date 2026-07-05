@@ -78,30 +78,22 @@ async def stats():
 # OpenAI-compatible passthrough with token capture
 # --------------------------------------------------------------------------
 
-def _extract_tokens(data: dict) -> tuple[list[int], list[int], list[float]]:
-    """Pull prompt ids, response ids, and behavior logprobs out of a vLLM
-    chat.completions response. Fails loudly on any misalignment: silently
-    dropping or padding here is exactly how gradients get corrupted."""
-    choice = data["choices"][0]
+async def _fetch_prompt_ids(messages: list, model: str) -> list[int]:
+    """Tokenize the prompt via vLLM's /tokenize endpoint.
 
-    prompt_ids = data.get("prompt_token_ids") or choice.get("prompt_token_ids")
-    resp_ids = choice.get("token_ids") or data.get("token_ids")
-    if prompt_ids is None or resp_ids is None:
-        raise HTTPException(
-            502,
-            "vLLM response lacks token ids. Ensure vLLM >= 0.11 and that "
-            "return_token_ids is supported on this endpoint.",
-        )
-
-    lp_content = (choice.get("logprobs") or {}).get("content") or []
-    logprobs = [t["logprob"] for t in lp_content]
-    if len(logprobs) != len(resp_ids):
-        raise HTTPException(
-            502,
-            f"logprobs ({len(logprobs)}) misaligned with sampled tokens "
-            f"({len(resp_ids)}); refusing to record this transition.",
-        )
-    return list(prompt_ids), list(resp_ids), logprobs
+    vLLM's chat.completions response does not reliably populate
+    prompt_token_ids across versions — it may be absent or an empty list.
+    A separate /tokenize call with the exact messages + add_generation_prompt
+    gives the canonical prompt ids that match what vLLM conditioned on.
+    """
+    r = await _client.post("/tokenize", json={
+        "model": model,
+        "messages": messages,
+        "add_generation_prompt": True,
+    })
+    if r.status_code != 200:
+        raise HTTPException(502, f"vLLM /tokenize failed ({r.status_code}): {r.text}")
+    return r.json()["tokens"]
 
 
 @app.post("/v1/chat/completions")
@@ -129,10 +121,51 @@ async def chat_completions(
     data = r.json()
 
     if x_trajectory_id:
-        prompt_ids, resp_ids, logprobs = _extract_tokens(data)
+        choice = data["choices"][0]
+
+        # Response token ids — field name has drifted across vLLM versions.
+        resp_ids: list[int] | None = choice.get("token_ids") or data.get("token_ids")
+        if not resp_ids:
+            raise HTTPException(
+                502,
+                "vLLM response lacks token_ids (choice.token_ids). "
+                "Ensure vLLM >= 0.11 and return_token_ids is supported. "
+                f"Keys present: choice={list(choice)}, top={list(data)}",
+            )
+
+        # Prompt token ids — NOT reliably returned by all vLLM versions.
+        # Fall back to a separate /tokenize call to get the exact ids that
+        # vLLM conditioned on. This is the only source of truth.
+        prompt_ids: list[int] = list(
+            data.get("prompt_token_ids") or choice.get("prompt_token_ids") or []
+        )
+        if not prompt_ids:
+            prompt_ids = await _fetch_prompt_ids(
+                body["messages"], body.get("model", BASE_MODEL)
+            )
+
+        # Assert against usage counter — mismatch means template drift.
+        usage_prompt = (data.get("usage") or {}).get("prompt_tokens")
+        if usage_prompt and len(prompt_ids) != usage_prompt:
+            raise HTTPException(
+                502,
+                f"prompt_token_ids length ({len(prompt_ids)}) != "
+                f"usage.prompt_tokens ({usage_prompt}). "
+                "Chat template mismatch between /tokenize and vLLM inference.",
+            )
+
+        lp_content = (choice.get("logprobs") or {}).get("content") or []
+        logprobs = [t["logprob"] for t in lp_content]
+        if len(logprobs) != len(resp_ids):
+            raise HTTPException(
+                502,
+                f"logprobs ({len(logprobs)}) misaligned with sampled tokens "
+                f"({len(resp_ids)}); refusing to record this transition.",
+            )
+
         store.record(x_trajectory_id, Transition(
             prompt_token_ids=prompt_ids,
-            response_token_ids=resp_ids,
+            response_token_ids=list(resp_ids),
             logprobs=logprobs,
             adapter_version=state["adapter_version"],
         ))

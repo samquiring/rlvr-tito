@@ -25,6 +25,35 @@ import torch
 from .grpo import gather_logprobs, group_advantages, grpo_loss
 from .store import Trajectory, Transition
 
+
+def _check_parity_match(
+    forward_lps: list[float],
+    stored_lps: list[float],
+    tol: float,
+    idx: int,
+) -> None:
+    """Raise RuntimeError if forward and stored logprobs diverge beyond tol.
+
+    Pure function so it can be unit-tested without a real model.
+    Called by GRPOTrainer.parity_check before the first gradient step.
+    """
+    if len(forward_lps) != len(stored_lps):
+        raise RuntimeError(
+            f"Parity check transition {idx}: length mismatch — "
+            f"forward={len(forward_lps)}, stored={len(stored_lps)}. "
+            "prompt_token_ids has the wrong length."
+        )
+    max_diff = max(abs(a - b) for a, b in zip(forward_lps, stored_lps))
+    if max_diff > tol:
+        raise RuntimeError(
+            f"Parity check transition {idx}: max |forward − stored| = "
+            f"{max_diff:.4f} > {tol}. "
+            f"forward[:5]={[f'{x:.3f}' for x in forward_lps[:5]]} "
+            f"stored[:5]={[f'{x:.3f}' for x in stored_lps[:5]]}. "
+            "Prompt reconstruction or logprob capture has drifted — "
+            "importance ratios will be garbage. Aborting before first step."
+        )
+
 log = logging.getLogger("rlvr_tito.trainer")
 
 
@@ -156,10 +185,53 @@ class GRPOTrainer:
         self.opt = torch.optim.AdamW(
             (p for p in self.model.parameters() if p.requires_grad), lr=cfg.lr)
 
+    # -- on-policy parity gate -----------------------------------------------
+
+    def parity_check(
+        self, transitions: list[Transition], tol: float = 0.05, n: int = 3
+    ) -> None:
+        """Assert trainer forward-pass logprobs ≈ stored behavior logprobs.
+
+        Must be called before the first gradient step (version == 0), when
+        LoRA B-matrices are zero so the trainer is equivalent to the base
+        model that vLLM was serving. Any mismatch means wrong prompt_token_ids
+        or a model/template mismatch, and every importance ratio would be
+        garbage. Better to abort loudly here than to diverge silently.
+
+        Only checks adapter_version==0 transitions (base-model rollouts).
+        """
+        candidates = [t for t in transitions if t.adapter_version == 0][:n]
+        if not candidates:
+            log.warning("parity_check: no adapter_version==0 transitions; skipping")
+            return
+
+        self.model.eval()
+        with torch.no_grad():
+            for i, tr in enumerate(candidates):
+                ids = torch.tensor(
+                    [tr.prompt_token_ids + tr.response_token_ids],
+                    dtype=torch.long,
+                    device=self.cfg.device,
+                )
+                logits = self.model(input_ids=ids).logits
+                logp = gather_logprobs(logits[:, :-1], ids[:, 1:])
+                # Response token logprobs in the causal-shifted view start at
+                # position prompt_len-1 (predicting ids[prompt_len]).
+                p = len(tr.prompt_token_ids)
+                forward_lps = logp[0, p - 1 : p - 1 + len(tr.response_token_ids)].tolist()
+                _check_parity_match(forward_lps, list(tr.logprobs), tol, i)
+                log.info("parity check %d/%d ok  max_diff=%.4f", i + 1, len(candidates),
+                         max(abs(a - b) for a, b in zip(forward_lps, tr.logprobs)))
+        self.model.train()
+
     # -- one GRPO step on one group ------------------------------------------
 
     def train_on_group(self, group: list[Trajectory]) -> dict:
         transitions, advs = flatten_group(group)
+
+        if self.version == 0:
+            self.parity_check(transitions)
+
         batch = collate_transitions(
             transitions, advs, self.tokenizer.pad_token_id or 0,
             self.cfg.max_seq_len)

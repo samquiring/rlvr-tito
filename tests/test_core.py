@@ -9,7 +9,7 @@ import torch
 
 from rlvr_tito.grpo import group_advantages, grpo_loss, gather_logprobs
 from rlvr_tito.store import GroupStore, Transition
-from rlvr_tito.trainer import collate_transitions, flatten_group
+from rlvr_tito.trainer import collate_transitions, flatten_group, _check_parity_match
 
 
 def test_group_advantages():
@@ -129,6 +129,26 @@ def test_flatten_group_broadcasts_advantage():
     assert len(transitions) == 5
     assert advs[0] == advs[1] == advs[2] > 0
     assert advs[3] == advs[4] < 0
+
+
+def test_parity_check_passes_within_tolerance():
+    _check_parity_match([-1.01, -2.005], [-1.0, -2.0], tol=0.05, idx=0)
+
+
+def test_parity_check_detects_logprob_drift():
+    try:
+        _check_parity_match([-1.0, -2.0], [-1.5, -2.5], tol=0.05, idx=0)
+        raise AssertionError("should have raised")
+    except RuntimeError as e:
+        assert "drift" in str(e).lower() or "drifted" in str(e).lower()
+
+
+def test_parity_check_detects_length_mismatch():
+    try:
+        _check_parity_match([-1.0, -2.0], [-1.0], tol=0.05, idx=1)
+        raise AssertionError("should have raised")
+    except RuntimeError as e:
+        assert "length mismatch" in str(e).lower()
 
 
 if __name__ == "__main__":
