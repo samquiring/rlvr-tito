@@ -3,9 +3,11 @@ which transparently captures exact token ids + logprobs for RL training.
 
 The agent's contract is deliberately tiny:
 
-  1. POST /trajectories                {"task_id": "..."} -> {"traj_id": ...}
-  2. POST /v1/chat/completions        as usual, plus header X-Trajectory-ID
-  3. POST /trajectories/{id}/reward   {"reward": 1.0} when the episode ends
+  1. POST   /trajectories               {"task_id": "..."} -> {"traj_id": ...}
+  2. POST   /v1/chat/completions        as usual, plus header X-Trajectory-ID
+  3. POST   /trajectories/{id}/reward   {"reward": 1.0} when the episode ends
+  4. DELETE /trajectories/{id}          if the rollout failed for infra reasons
+                                        (never post reward=0 for a crash)
 
 Everything else (return_token_ids, logprobs capture, adapter routing, GRPO
 grouping) happens here. The agent never sees a token id, never tokenizes, and
@@ -23,6 +25,7 @@ behavior logprobs ride along with every transition.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import threading
@@ -39,10 +42,11 @@ VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8000")
 BASE_MODEL = os.environ.get("MODEL", "")
 GROUP_SIZE = int(os.environ.get("GROUP_SIZE", "8"))
 TRAIN = os.environ.get("TRAIN", "0") == "1"
+METRICS_PATH = os.environ.get("METRICS_PATH", "./trainer_metrics.jsonl")
 
 app = FastAPI(title="rlvr-tito proxy")
 store = GroupStore(group_size=GROUP_SIZE)
-state = {"adapter": None, "adapter_version": 0}
+state = {"adapter": None, "adapter_version": 0, "last_step_metrics": {}}
 _client = httpx.AsyncClient(base_url=VLLM_URL, timeout=600)
 
 
@@ -69,9 +73,24 @@ async def complete_trajectory(traj_id: str, body: dict):
     return {"ok": True}
 
 
+@app.delete("/trajectories/{traj_id}")
+async def abort_trajectory(traj_id: str):
+    """Discard a failed rollout so it never enters a training group."""
+    try:
+        store.abort(traj_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown trajectory {traj_id}")
+    return {"ok": True}
+
+
 @app.get("/stats")
 async def stats():
-    return {**store.stats, "adapter": state["adapter"]}
+    return {
+        **store.stats,
+        "adapter": state["adapter"],
+        "adapter_version": state["adapter_version"],
+        "last_step_metrics": state["last_step_metrics"],
+    }
 
 
 # --------------------------------------------------------------------------
@@ -181,9 +200,44 @@ async def chat_completions(
 # Optional in-process training loop
 # --------------------------------------------------------------------------
 
+def _wait_for_vllm(timeout: float = 900.0) -> None:
+    """Block until vLLM is serving BASE_MODEL. Loading the trainer model onto
+    the GPU while vLLM is still initializing is the classic OOM race on a
+    shared card: vLLM's profiling spikes above its steady-state budget, so the
+    trainer must not allocate until vLLM has settled. This gate enforces the
+    startup order in code instead of relying on launch scripts to get it right."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            r = httpx.get(f"{VLLM_URL}/v1/models", timeout=5)
+            if r.status_code == 200:
+                served = [m["id"] for m in r.json().get("data", [])]
+                if not BASE_MODEL or BASE_MODEL in served:
+                    log.info("vLLM ready, serving %s", served)
+                    return
+                log.warning("vLLM up but serving %s, want %s", served, BASE_MODEL)
+        except httpx.HTTPError:
+            pass
+        time.sleep(10)
+    raise RuntimeError(
+        f"vLLM at {VLLM_URL} not serving {BASE_MODEL!r} after {timeout}s — "
+        "refusing to load the trainer model onto a GPU vLLM may still be "
+        "initializing on. Start vLLM first and wait for /v1/models."
+    )
+
+
+def _append_metrics(record: dict) -> None:
+    try:
+        with open(METRICS_PATH, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        log.warning("could not write metrics to %s: %s", METRICS_PATH, exc)
+
+
 def _training_loop():
     from .trainer import GRPOTrainer, TrainerConfig
 
+    _wait_for_vllm()
     cfg = TrainerConfig.from_env(vllm_base_url=VLLM_URL)
     trainer = GRPOTrainer(cfg)
     log.info("trainer ready; polling for groups of %d", GROUP_SIZE)
@@ -192,11 +246,38 @@ def _training_loop():
         if group is None:
             time.sleep(2.0)
             continue
+        rewards = [t.reward for t in group]
         metrics = trainer.train_on_group(group)
-        adapter = trainer.push_adapter()
+
+        # A failed push must not kill the loop: sampling continues on the old
+        # adapter and the importance ratio absorbs the one-step lag. Retry a
+        # few times (vLLM may be busy), then log loudly and move on.
+        adapter = state["adapter"]
+        for attempt in range(3):
+            try:
+                adapter = trainer.push_adapter()
+                break
+            except Exception as exc:
+                log.error("push_adapter attempt %d failed: %s", attempt + 1, exc)
+                time.sleep(5)
+        else:
+            log.error("adapter push failed 3x — still serving %s; will retry "
+                      "after the next group", adapter)
         state["adapter"] = adapter
         state["adapter_version"] = trainer.version
-        log.info("step %d done: %s", trainer.version, metrics)
+        state["last_step_metrics"] = metrics
+
+        record = {
+            "ts": time.time(),
+            "step": trainer.version,
+            "task_id": group[0].task_id,
+            "rewards": rewards,
+            "reward_mean": sum(rewards) / len(rewards),
+            "adapter": adapter,
+            **metrics,
+        }
+        _append_metrics(record)
+        log.info("step %d done: %s", trainer.version, record)
 
 
 @app.on_event("startup")

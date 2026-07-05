@@ -67,7 +67,7 @@ class GroupStore:
         self._traj: dict[str, Trajectory] = {}
         self._completed: dict[str, list[Trajectory]] = {}
         self._lock = threading.Lock()
-        self.stats = {"trajectories": 0, "transitions": 0,
+        self.stats = {"trajectories": 0, "transitions": 0, "aborted": 0,
                       "groups_ready": 0, "groups_dropped_degenerate": 0}
 
     # -- rollout-time API (called by the proxy) ------------------------------
@@ -96,6 +96,21 @@ class GroupStore:
                 raise KeyError(f"unknown trajectory {traj_id}")
             traj.reward = float(reward)
             self._completed.setdefault(traj.task_id, []).append(traj)
+
+    def abort(self, traj_id: str) -> None:
+        """Discard a trajectory whose rollout failed for infrastructure reasons
+        (LLM 500s, network errors, simulator crashes).
+
+        This exists so drivers never have to post reward=0.0 for a rollout that
+        failed before the episode could be judged. A zero reward from a dead
+        vLLM is indistinguishable from a zero reward from bad policy behavior,
+        and training on it teaches the model that whatever it sampled was wrong.
+        Aborted trajectories leave the group unfilled; the driver retries the
+        rollout to fill the slot instead."""
+        with self._lock:
+            if self._traj.pop(traj_id, None) is None:
+                raise KeyError(f"unknown trajectory {traj_id}")
+            self.stats["aborted"] += 1
 
     # -- trainer-side API -----------------------------------------------------
 

@@ -118,6 +118,33 @@ def test_group_store_lifecycle():
     assert s.pop_ready_group() is None                  # B incomplete
 
 
+def test_group_store_abort_discards_failed_rollout():
+    """An aborted trajectory must never fill a group slot: a rollout that
+    crashed for infra reasons carries no reward signal, and scoring it 0.0
+    would teach the model its never-judged actions were wrong."""
+    s = GroupStore(group_size=2)
+    t1 = s.start_trajectory("A")
+    s.record(t1, Transition([1], [2], [-0.1], 0))
+    s.complete(t1, 1.0)
+    t2 = s.start_trajectory("A")
+    s.record(t2, Transition([1], [2], [-0.1], 0))
+    s.abort(t2)                                          # infra failure
+    assert s.pop_ready_group() is None                   # group NOT filled
+    assert s.stats["aborted"] == 1
+    # a retry fills the slot and the group becomes trainable
+    t3 = s.start_trajectory("A")
+    s.record(t3, Transition([1], [2], [-0.1], 0))
+    s.complete(t3, 0.0)
+    group = s.pop_ready_group()
+    assert group is not None and len(group) == 2
+    # aborting an unknown/already-completed trajectory raises
+    try:
+        s.abort(t1)
+        assert False, "expected KeyError"
+    except KeyError:
+        pass
+
+
 def test_group_store_drops_degenerate():
     s = GroupStore(group_size=2, drop_degenerate=True)
     for _ in range(2):

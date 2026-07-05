@@ -88,7 +88,18 @@ make the importance ratio exact and the clip bounds the update.
 
 ## Running it
 
-Single GPU (example: RTX 3090, Qwen3.5-0.8B):
+On a pod, prefer the stack manager — it handles GPU cleanup, the
+vLLM-before-trainer startup order, and readiness checks that plain nohup
+commands get wrong (see `docs/RUNBOOK.md` for what goes wrong and why):
+
+```bash
+MODEL=Qwen/Qwen3.5-4B scripts/stack.sh start
+scripts/stack.sh train --rounds 30 --tasks-per-round 4 --group-size 8
+scripts/stack.sh status
+scripts/stack.sh stop
+```
+
+Manually, single GPU (example: RTX 3090, Qwen3.5-0.8B):
 
 ```bash
 # 1. vLLM serving the policy

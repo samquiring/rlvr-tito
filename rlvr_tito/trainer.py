@@ -254,7 +254,13 @@ class GRPOTrainer:
             transitions, advs, self.tokenizer.pad_token_id or 0,
             self.cfg.max_seq_len)
         if not batch:
-            return {}
+            log.error(
+                "ALL %d transitions in this group exceeded max_seq_len=%d — "
+                "the group produced zero gradient. Raise max_seq_len.",
+                len(transitions), self.cfg.max_seq_len,
+            )
+            return {"n_transitions": len(transitions),
+                    "n_skipped_overlong": len(transitions)}
 
         self.model.train()
         self.opt.zero_grad(set_to_none=True)
@@ -300,6 +306,11 @@ class GRPOTrainer:
             (p for p in self.model.parameters() if p.requires_grad),
             self.cfg.grad_clip)
         self.opt.step()
+        # Skip rate is a training-health signal: transitions dropped for
+        # exceeding max_seq_len shrink the effective group and bias advantage
+        # estimates toward short episodes. Alert if this climbs above ~10%.
+        total_metrics["n_transitions"] = len(transitions)
+        total_metrics["n_skipped_overlong"] = len(transitions) - B
         return total_metrics
 
     # -- weight sync -----------------------------------------------------------
