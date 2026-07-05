@@ -47,7 +47,7 @@ class TrainerConfig:
     vllm_base_url: str = "http://localhost:8000"
     device: str = "cuda"
     dtype: str = "bfloat16"
-    attn_implementation: str = "flash_attention_2"
+    attn_implementation: str = "sdpa"
     gradient_checkpointing: bool = True
 
     @classmethod
