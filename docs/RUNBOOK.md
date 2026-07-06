@@ -68,6 +68,34 @@ exception and retries the slot with a fresh seed. If a slot fails
 not a training signal. Watch `aborted` in `/stats` — a nonzero-but-small
 count is normal, a climbing count means the stack is unhealthy.
 
+## Pod provisioning gotchas (RunPod)
+
+- **API-created pods don't start sshd.** The web UI injects your account SSH
+  key as the `PUBLIC_KEY` env var, which the image's start script needs to
+  launch sshd. Pods created via the API get no such injection — both direct
+  and proxy SSH will fail (proxy authenticates at the gateway, then dies
+  reaching pod:22). Always pass `PUBLIC_KEY` in the create request's env.
+- **Check the host driver before installing.** `pip install vllm` pulls the
+  newest torch (cu130 as of vLLM 0.24), but CUDA 13 wheels need driver
+  r580+. A host on r550 (CUDA 12.4) fails at engine init with
+  "The NVIDIA driver on your system is too old". Fix: install the CUDA-12
+  variant wheel from vLLM's GitHub releases with `--no-deps`, then
+  force-reinstall torch from the matching PyTorch index:
+
+  ```bash
+  wget https://github.com/vllm-project/vllm/releases/download/v0.24.0/vllm-0.24.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl
+  pip install --force-reinstall --no-deps vllm-0.24.0+cu129-*.whl
+  pip install --force-reinstall torch==2.11.0 torchvision torchaudio \
+      --index-url https://download.pytorch.org/whl/cu128
+  ```
+
+  CUDA 12.x minor versions are driver-compatible with each other (cu128/cu129
+  run on r550); the 12→13 major jump is not.
+- **PEP 668**: recent images mark system Python externally-managed; every
+  pip install needs `--break-system-packages` (fine in a disposable container).
+- **Don't trust `pip ... | tail -1; echo RC=$?`** — that captures tail's exit
+  code, not pip's. Redirect to a log file and check pip's own status.
+
 ## Startup order (why it matters)
 
 ```
