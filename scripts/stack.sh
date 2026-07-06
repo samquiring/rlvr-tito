@@ -28,6 +28,8 @@
 #   ENFORCE_EAGER  1 = skip torch.compile/CUDA graphs. Slower decode but
 #                  removes the init memory spike and ~5 min of startup;
 #                  use on cards where vLLM init OOMs (default 1)
+#   TOOL_PARSER    vLLM --tool-call-parser (default qwen3_xml — the parser
+#                  for Qwen3/3.5 tool-call output; use hermes for Qwen2.5)
 #   VLLM_PORT      (default 8000)   PROXY_PORT (default 9000)
 #   LOG_DIR        (default /workspace/logs)
 #   SECRETS_FILE   env file with ANTHROPIC_API_KEY (default /workspace/secrets.env)
@@ -41,6 +43,7 @@ MODEL="${MODEL:-Qwen/Qwen3.5-4B}"
 GPU_UTIL="${GPU_UTIL:-0.50}"
 GROUP_SIZE="${GROUP_SIZE:-8}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
+TOOL_PARSER="${TOOL_PARSER:-qwen3_xml}"
 VLLM_PORT="${VLLM_PORT:-8000}"
 PROXY_PORT="${PROXY_PORT:-9000}"
 LOG_DIR="${LOG_DIR:-/workspace/logs}"
@@ -96,12 +99,12 @@ cmd_start() {
     # invocation of this script never returns (backgrounded children keep the
     # session's stdin open and the remote shell hangs after the script ends).
     # --enable-auto-tool-choice + parser: tau2 agents send tool_choice="auto";
-    # vLLM 400s every request without these. hermes parses Qwen's
-    # <tool_call>{json}</tool_call> output format.
+    # vLLM 400s every request without these. qwen3_xml parses Qwen3/3.5
+    # tool-call output (hermes is for Qwen2.5-era JSON-in-<tool_call> format).
     VLLM_ALLOW_RUNTIME_LORA_UPDATING=1 setsid nohup vllm serve "$MODEL" \
         --enable-lora --max-lora-rank 32 --port "$VLLM_PORT" \
         --gpu-memory-utilization "$GPU_UTIL" $eager_flag \
-        --enable-auto-tool-choice --tool-call-parser hermes \
+        --enable-auto-tool-choice --tool-call-parser "$TOOL_PARSER" \
         > "$LOG_DIR/vllm.log" 2>&1 < /dev/null &
     local vllm_pid=$!
 
