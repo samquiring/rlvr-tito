@@ -95,6 +95,19 @@ count is normal, a climbing count means the stack is unhealthy.
   pip install needs `--break-system-packages` (fine in a disposable container).
 - **Don't trust `pip ... | tail -1; echo RC=$?`** — that captures tail's exit
   code, not pip's. Redirect to a log file and check pip's own status.
+- **`restart-pod` wipes the container disk when no network volume is
+  attached.** /workspace, pip installs, secrets — all gone; only a mounted
+  network volume survives. Restart also reassigns the public SSH port, so
+  re-query the pod for the new mapping. Treat restart as re-provisioning
+  (keep the setup scripted), or attach a network volume for anything you
+  can't recreate. The one thing restart is good for: clearing a leaked CUDA
+  context that `kill`/`fuser` can't free (dead pid still holding GiBs in
+  nvidia-smi with process name `[Not Found]`).
+- **A killed vLLM can leak its CUDA context.** After SIGKILL mid-inference,
+  nvidia-smi may show the dead pid holding all its memory indefinitely; the
+  driver (r550) never reaps it and no in-container command can. Prefer
+  graceful shutdown (SIGTERM first, wait, then SIGKILL); if leaked, restart
+  the pod.
 
 ## Startup order (why it matters)
 
