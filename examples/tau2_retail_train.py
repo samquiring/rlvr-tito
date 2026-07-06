@@ -217,9 +217,14 @@ def run_eval(
         for f in as_completed(futs):
             tid = futs[f]
             try:
-                results.setdefault(tid, []).append(f.result())
+                # f.result() must be evaluated BEFORE touching the dict:
+                # setdefault-then-append would create an empty entry when
+                # result() raises, and empty lists break the mean below.
+                r = f.result()
             except Exception as exc:
                 print(f"  eval rollout failed for task {tid}: {exc}")
+                continue
+            results.setdefault(tid, []).append(r)
 
     all_rewards = [r for rs in results.values() for r in rs]
     return {

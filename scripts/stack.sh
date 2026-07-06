@@ -92,10 +92,17 @@ cmd_start() {
     [ "$ENFORCE_EAGER" = "1" ] && eager_flag="--enforce-eager"
 
     echo "[1/3] Starting vLLM ($MODEL, gpu-util $GPU_UTIL ${eager_flag:+, eager})..."
-    VLLM_ALLOW_RUNTIME_LORA_UPDATING=1 nohup vllm serve "$MODEL" \
+    # setsid + </dev/null: fully detach from the calling session, or an ssh
+    # invocation of this script never returns (backgrounded children keep the
+    # session's stdin open and the remote shell hangs after the script ends).
+    # --enable-auto-tool-choice + parser: tau2 agents send tool_choice="auto";
+    # vLLM 400s every request without these. hermes parses Qwen's
+    # <tool_call>{json}</tool_call> output format.
+    VLLM_ALLOW_RUNTIME_LORA_UPDATING=1 setsid nohup vllm serve "$MODEL" \
         --enable-lora --max-lora-rank 32 --port "$VLLM_PORT" \
         --gpu-memory-utilization "$GPU_UTIL" $eager_flag \
-        > "$LOG_DIR/vllm.log" 2>&1 &
+        --enable-auto-tool-choice --tool-call-parser hermes \
+        > "$LOG_DIR/vllm.log" 2>&1 < /dev/null &
     local vllm_pid=$!
 
     # Ready = model listed in /v1/models AND weights visibly on the GPU.
@@ -127,8 +134,8 @@ cmd_start() {
         MODEL="$MODEL" GROUP_SIZE="$GROUP_SIZE" \
         METRICS_PATH="$LOG_DIR/trainer_metrics.jsonl" \
         PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-        nohup uvicorn rlvr_tito.proxy:app --host 0.0.0.0 --port "$PROXY_PORT" \
-        > "$LOG_DIR/proxy.log" 2>&1 &)
+        setsid nohup uvicorn rlvr_tito.proxy:app --host 0.0.0.0 --port "$PROXY_PORT" \
+        > "$LOG_DIR/proxy.log" 2>&1 < /dev/null &)
 
     echo "     Waiting for proxy..."
     for i in $(seq 1 30); do
@@ -156,9 +163,9 @@ cmd_train() {
     source "$SECRETS_FILE"; set +a
     echo "Starting training driver (log: $LOG_DIR/train.log)..."
     TAU2_PATH="$TAU2_PATH" PROXY_URL="http://localhost:${PROXY_PORT}" MODEL="$MODEL" \
-        nohup python "$REPO_DIR/examples/tau2_retail_train.py" \
+        setsid nohup python "$REPO_DIR/examples/tau2_retail_train.py" \
         --metrics-path "$LOG_DIR/rollout_metrics.jsonl" "$@" \
-        > "$LOG_DIR/train.log" 2>&1 &
+        > "$LOG_DIR/train.log" 2>&1 < /dev/null &
     echo "Driver PID $!. Follow with: tail -f $LOG_DIR/train.log"
 }
 
