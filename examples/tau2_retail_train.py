@@ -83,6 +83,7 @@ def _one_rollout(
     anthropic_api_key: str,
     seed: int,
     record: bool = True,
+    max_steps: int = 200,
 ) -> float:
     """Run one tau2 retail episode; return the composite reward.
 
@@ -115,6 +116,12 @@ def _one_rollout(
         },
         llm_user=_USER_MODEL,
         llm_args_user={"api_key": anthropic_api_key},
+        # Pinned explicitly: tau2 has BOTH a 200-turn config default and a
+        # 100-step orchestrator fallback depending on entry point. Episodes
+        # truncated by a low cap get judged as failures — reward says the
+        # policy was wrong when really the clock ran out (false negatives
+        # that poison training groups).
+        max_steps=max_steps,
     )
 
     try:
@@ -154,6 +161,7 @@ def run_task_group(
     workers: int,
     base_seed: int,
     max_retries: int = 2,
+    max_steps: int = 200,
 ) -> tuple[list[float], int]:
     """Run GROUP_SIZE successful rollouts for one task in parallel.
 
@@ -167,7 +175,7 @@ def run_task_group(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = {
             pool.submit(_one_rollout, task, proxy_url, model,
-                        anthropic_api_key, base_seed + i): 0
+                        anthropic_api_key, base_seed + i, True, max_steps): 0
             for i in range(group_size)
         }
         retry_seed = base_seed + group_size  # fresh seeds for retries
@@ -189,7 +197,7 @@ def run_task_group(
                     ) from exc
                 pending[pool.submit(
                     _one_rollout, task, proxy_url, model,
-                    anthropic_api_key, retry_seed)] = attempt + 1
+                    anthropic_api_key, retry_seed, True, max_steps)] = attempt + 1
                 retry_seed += 1
     return rewards, n_failures
 
@@ -204,6 +212,7 @@ def run_eval(
     workers: int,
     seed: int,
     rollouts_per_task: int = 1,
+    max_steps: int = 200,
 ) -> dict:
     """Run held-out tasks without trajectory recording; return reward summary."""
     results: dict[str, list[float]] = {}
@@ -212,7 +221,7 @@ def run_eval(
         for task in tasks:
             for i in range(rollouts_per_task):
                 f = pool.submit(_one_rollout, task, proxy_url, model,
-                                anthropic_api_key, seed + i, False)
+                                anthropic_api_key, seed + i, False, max_steps)
                 futs[f] = str(task.id)
         for f in as_completed(futs):
             tid = futs[f]
@@ -272,6 +281,8 @@ def main() -> None:
                     help="rollouts per eval task")
     ap.add_argument("--metrics-path", default="./rollout_metrics.jsonl",
                     help="JSONL file for per-round and eval metrics")
+    ap.add_argument("--max-steps", type=int, default=200,
+                    help="max conversation turns per episode; low caps truncate episodes into false failures")
     ap.add_argument("--skip-baseline", action="store_true",
                     help="skip the round-0 eval (resuming a run whose baseline "
                          "is already recorded under the same reward config)")
@@ -317,7 +328,7 @@ def main() -> None:
         print(f"── eval @ round {rnd} ({len(eval_tasks)} held-out tasks) ──")
         ev = run_eval(eval_tasks, args.proxy, args.model, _ANTHROPIC_KEY,
                       args.workers, args.seed + 90_000 + rnd,
-                      args.eval_rollouts)
+                      args.eval_rollouts, args.max_steps)
         adapter = httpx.get(f"{args.proxy}/stats", timeout=10).json().get("adapter")
         print(f"eval @ round {rnd}: reward_mean={ev['reward_mean']:.3f} "
               f"({ev['n_completed']} episodes, adapter={adapter})")
@@ -345,6 +356,7 @@ def main() -> None:
                 workers=args.workers,
                 base_seed=base_seed,
                 max_retries=args.max_retries,
+                max_steps=args.max_steps,
             )
             mean_r = sum(rewards) / len(rewards)
             round_rewards.extend(rewards)

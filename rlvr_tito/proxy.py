@@ -240,6 +240,13 @@ def _training_loop():
     _wait_for_vllm()
     cfg = TrainerConfig.from_env(vllm_base_url=VLLM_URL)
     trainer = GRPOTrainer(cfg)
+    if trainer.version > 0:
+        # Resumed from a checkpoint: make vLLM serve those weights NOW, or
+        # rollouts sample the base model while the trainer holds policy_vN.
+        state["adapter"] = trainer.register_current_adapter()
+        state["adapter_version"] = trainer.version
+        log.info("resumed at version %d; serving %s",
+                 trainer.version, state["adapter"])
     log.info("trainer ready; polling for groups of %d", GROUP_SIZE)
     while True:
         group = store.pop_ready_group()
@@ -248,6 +255,15 @@ def _training_loop():
             continue
         rewards = [t.reward for t in group]
         metrics = trainer.train_on_group(group)
+
+        if metrics.get("oom_skipped_group"):
+            # No gradient was applied — pushing would mint a new version of
+            # identical weights. Record the event and move on.
+            state["last_step_metrics"] = metrics
+            _append_metrics({"ts": time.time(), "step": trainer.version,
+                             "task_id": group[0].task_id, "rewards": rewards,
+                             **metrics})
+            continue
 
         # A failed push must not kill the loop: sampling continues on the old
         # adapter and the importance ratio absorbs the one-step lag. Retry a

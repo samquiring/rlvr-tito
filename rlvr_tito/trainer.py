@@ -64,7 +64,13 @@ class TrainerConfig:
     # Keep sdpa. FA2 crashes on hybrid attention (IMMA kernel path is
     # incompatible) even at sequence length 64. Do not revert to flash_attention_2.
     attn_implementation: str = "sdpa"
+    # Keep ON. Disabling trades ~2x step speed for O(layers x T) activation
+    # memory — long-episode backwards then OOM even on a dedicated 48 GB card.
     gradient_checkpointing: bool = True
+    # Resume from a previously saved adapters/policy_v{N} checkpoint. The LoRA
+    # weights are restored and version continues from N; AdamW moments are NOT
+    # restored (fresh optimizer state — acceptable for LoRA-scale RL).
+    resume_version: int = 0
 
     @classmethod
     def from_env(cls, **overrides) -> "TrainerConfig":
@@ -77,8 +83,11 @@ class TrainerConfig:
             "adapter_dir": os.environ.get("ADAPTER_DIR"),
             "lr": float(os.environ["LR"]) if "LR" in os.environ else None,
             "lora_rank": int(os.environ["LORA_RANK"]) if "LORA_RANK" in os.environ else None,
-            "gradient_checkpointing":
-                os.environ.get("GRAD_CKPT", "1") == "1" if "GRAD_CKPT" in os.environ else None,
+            "resume_version":
+                int(os.environ["RESUME_VERSION"]) if "RESUME_VERSION" in os.environ else None,
+            # Defaults ON even when the var is unset; only an explicit
+            # GRAD_CKPT=0 disables (and __init__ warns loudly if it does).
+            "gradient_checkpointing": os.environ.get("GRAD_CKPT", "1") == "1",
         }
         kwargs = {k: v for k, v in env.items() if v is not None}
         kwargs.update(overrides)
@@ -155,11 +164,11 @@ def flatten_group(group: list[Trajectory]) -> tuple[list[Transition], list[float
 
 class GRPOTrainer:
     def __init__(self, cfg: TrainerConfig):
-        from peft import LoraConfig, get_peft_model
+        from peft import LoraConfig, PeftModel, get_peft_model
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
         self.cfg = cfg
-        self.version = 0
+        self.version = int(cfg.resume_version)
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.model_name)
         base = AutoModelForCausalLM.from_pretrained(
             cfg.model_name,
@@ -169,13 +178,49 @@ class GRPOTrainer:
         )
         if cfg.gradient_checkpointing:
             base.gradient_checkpointing_enable()
-        self.model = get_peft_model(base, LoraConfig(
-            r=cfg.lora_rank, lora_alpha=cfg.lora_alpha,
-            target_modules=list(cfg.lora_target_modules),
-            task_type="CAUSAL_LM",
-        ))
+            # With LoRA all base params (incl. embeddings) are frozen, so
+            # checkpointed segments see no grad-requiring inputs and the
+            # backward silently produces no adapter gradients without this.
+            base.enable_input_require_grads()
+        else:
+            log.warning(
+                "gradient checkpointing is DISABLED — activation memory grows "
+                "with layers x sequence length and long-episode backwards WILL "
+                "OOM. Set GRAD_CKPT=1 unless you know exactly why not.")
+
+        if self.version > 0:
+            path = os.path.abspath(
+                os.path.join(cfg.adapter_dir, f"policy_v{self.version}"))
+            if not os.path.isdir(path):
+                raise FileNotFoundError(
+                    f"resume_version={self.version} but no checkpoint at {path}")
+            self.model = PeftModel.from_pretrained(base, path, is_trainable=True)
+            log.info("resumed adapter from %s (version %d)", path, self.version)
+        else:
+            self.model = get_peft_model(base, LoraConfig(
+                r=cfg.lora_rank, lora_alpha=cfg.lora_alpha,
+                target_modules=list(cfg.lora_target_modules),
+                task_type="CAUSAL_LM",
+            ))
         self.opt = torch.optim.AdamW(
             (p for p in self.model.parameters() if p.requires_grad), lr=cfg.lr)
+
+    def register_current_adapter(self) -> str:
+        """Load the resumed adapter checkpoint into vLLM WITHOUT bumping the
+        version — used at startup after resume_version so serving matches the
+        trainer's restored weights before the next push creates v+1."""
+        import httpx
+
+        name = f"policy_v{self.version}"
+        path = os.path.abspath(os.path.join(self.cfg.adapter_dir, name))
+        r = httpx.post(
+            f"{self.cfg.vllm_base_url}/v1/load_lora_adapter",
+            json={"lora_name": name, "lora_path": path},
+            timeout=120,
+        )
+        r.raise_for_status()
+        log.info("registered resumed adapter %s with vLLM", name)
+        return name
 
     # -- one GRPO step on one group ------------------------------------------
 
@@ -268,6 +313,29 @@ class GRPOTrainer:
         return stats
 
     def train_on_group(self, group: list[Trajectory]) -> dict:
+        """One GRPO step with OOM recovery.
+
+        A mid-forward OOM leaves partial grads and fragmented reserved blocks
+        in the caching allocator; retrying on top of that fails at a fraction
+        of the true requirement. Clear both, then retry once — if it OOMs
+        again the group genuinely doesn't fit, so skip it loudly rather than
+        killing the training loop.
+        """
+        for attempt in (1, 2):
+            try:
+                return self._train_on_group_inner(group)
+            except torch.OutOfMemoryError:
+                self.opt.zero_grad(set_to_none=True)
+                torch.cuda.empty_cache()
+                log.warning(
+                    "OOM during GRPO step (attempt %d/2) — cleared grads and "
+                    "cache%s", attempt,
+                    "; retrying" if attempt == 1 else "")
+        log.error("GRPO step OOM'd twice — skipping this group. If this "
+                  "recurs, lower max_seq_len or give the trainer its own GPU.")
+        return {"oom_skipped_group": 1}
+
+    def _train_on_group_inner(self, group: list[Trajectory]) -> dict:
         transitions, advs = flatten_group(group)
 
         batch = collate_transitions(
