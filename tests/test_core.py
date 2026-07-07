@@ -207,6 +207,24 @@ def test_microbatch_gradient_equals_full_batch():
     )
 
 
+def test_gather_logprobs_chunked_matches_direct():
+    """Chunked computation must equal direct log_softmax+gather, values and
+    gradients both — it exists purely to bound fp32 memory on huge vocabs."""
+    torch.manual_seed(0)
+    logits_a = torch.randn(2, 10, 50, requires_grad=True)
+    logits_b = logits_a.detach().clone().requires_grad_(True)
+    labels = torch.randint(0, 50, (2, 10))
+
+    direct = torch.log_softmax(logits_a.float(), dim=-1).gather(
+        -1, labels.unsqueeze(-1)).squeeze(-1)
+    chunked = gather_logprobs(logits_b, labels, chunk_size=3)  # forces chunking
+    assert torch.allclose(direct, chunked, atol=1e-6)
+
+    direct.sum().backward()
+    chunked.sum().backward()
+    assert torch.allclose(logits_a.grad, logits_b.grad, atol=1e-6)
+
+
 def test_collation_carries_adapter_versions():
     """adapter_versions must stay row-aligned with input_ids after collation
     skips overlong transitions — the behavior-logprob recompute uses them to

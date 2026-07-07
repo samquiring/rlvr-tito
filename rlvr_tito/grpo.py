@@ -40,10 +40,26 @@ def group_advantages(rewards: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return r - r.mean()
 
 
-def gather_logprobs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Per-token log p(label) from logits. logits: (B, T, V), labels: (B, T)."""
-    logp = torch.log_softmax(logits.float(), dim=-1)
-    return logp.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+def gather_logprobs(
+    logits: torch.Tensor, labels: torch.Tensor, chunk_size: int = 1024
+) -> torch.Tensor:
+    """Per-token log p(label) from logits. logits: (B, T, V), labels: (B, T).
+
+    Chunked over T: log p(y) = logit_y − logsumexp(logits), computed per
+    time-slice so the fp32 upcast never materializes the full (T, V) tensor.
+    A naive log_softmax(logits.float()) on a 150k vocab needs ~600 KB/token
+    in fp32 — a 10k-token agent transition allocates 13+ GiB and OOMs the
+    shared GPU. Per chunk this is bounded at chunk_size × V × 4 bytes.
+    Differentiable; numerically identical to the unchunked version.
+    """
+    outs = []
+    for s in range(0, logits.shape[1], chunk_size):
+        piece = logits[:, s : s + chunk_size].float()
+        lse = torch.logsumexp(piece, dim=-1)                       # (B, C)
+        tgt = piece.gather(
+            -1, labels[:, s : s + chunk_size].unsqueeze(-1)).squeeze(-1)
+        outs.append(tgt - lse)
+    return torch.cat(outs, dim=1)
 
 
 def grpo_loss(
