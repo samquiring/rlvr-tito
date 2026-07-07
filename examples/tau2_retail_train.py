@@ -272,6 +272,9 @@ def main() -> None:
                     help="rollouts per eval task")
     ap.add_argument("--metrics-path", default="./rollout_metrics.jsonl",
                     help="JSONL file for per-round and eval metrics")
+    ap.add_argument("--skip-baseline", action="store_true",
+                    help="skip the round-0 eval (resuming a run whose baseline "
+                         "is already recorded under the same reward config)")
     args = ap.parse_args()
 
     if not _ANTHROPIC_KEY:
@@ -322,7 +325,8 @@ def main() -> None:
 
     rng = random.Random(args.seed)
 
-    maybe_eval(0)  # base-model baseline — the number every later eval is judged against
+    if not args.skip_baseline:
+        maybe_eval(0)  # base-model baseline — every later eval is judged against this
 
     for rnd in range(args.rounds):
         round_tasks = rng.sample(train_tasks,

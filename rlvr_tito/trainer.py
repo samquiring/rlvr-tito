@@ -207,22 +207,32 @@ class GRPOTrainer:
 
     def parity_check(
         self, transitions: list[Transition], tol: float = 0.05, n: int = 3
-    ) -> None:
-        """Assert trainer forward-pass logprobs ≈ stored behavior logprobs.
+    ) -> float:
+        """Compare trainer forward-pass logprobs to stored behavior logprobs.
 
-        Must be called before the first gradient step (version == 0), when
-        LoRA B-matrices are zero so the trainer is equivalent to the base
-        model that vLLM was serving. Any mismatch means wrong prompt_token_ids
-        or a model/template mismatch, and every importance ratio would be
-        garbage. Better to abort loudly here than to diverge silently.
+        Checks transitions whose adapter_version == self.version: at the time
+        train_on_group runs, the trainer's LoRA weights ARE that policy (the
+        step for this group hasn't happened yet), so its forward pass should
+        reproduce vLLM's sampling logprobs. At version 0 this proves the token
+        capture path (LoRA B-matrices are zero, trainer == base model) and any
+        mismatch ABORTS — wrong prompt ids make every importance ratio garbage.
+        At version > 0 a mismatch is logged as an error but does not abort:
+        vLLM's LoRA kernels (Punica) and PEFT's differ numerically, and a
+        spurious kill at step 20 costs more than a loud warning. Watch the
+        returned/logged parity_max_diff metric — sustained growth means real
+        drift, not kernel noise.
 
-        Only checks adapter_version==0 transitions (base-model rollouts).
+        Returns the max |forward − stored| over checked transitions (0.0 if
+        nothing was checkable).
         """
-        candidates = [t for t in transitions if t.adapter_version == 0][:n]
+        candidates = [t for t in transitions if t.adapter_version == self.version][:n]
         if not candidates:
-            log.warning("parity_check: no adapter_version==0 transitions; skipping")
-            return
+            log.warning("parity_check: no version-%d transitions; skipping",
+                        self.version)
+            return 0.0
 
+        strict = self.version == 0
+        worst = 0.0
         self.model.eval()
         with torch.no_grad():
             for i, tr in enumerate(candidates):
@@ -237,18 +247,30 @@ class GRPOTrainer:
                 # position prompt_len-1 (predicting ids[prompt_len]).
                 p = len(tr.prompt_token_ids)
                 forward_lps = logp[0, p - 1 : p - 1 + len(tr.response_token_ids)].tolist()
-                _check_parity_match(forward_lps, list(tr.logprobs), tol, i)
-                log.info("parity check %d/%d ok  max_diff=%.4f", i + 1, len(candidates),
-                         max(abs(a - b) for a, b in zip(forward_lps, tr.logprobs)))
+                try:
+                    _check_parity_match(forward_lps, list(tr.logprobs), tol, i)
+                except RuntimeError:
+                    if strict:
+                        self.model.train()
+                        raise
+                    log.error("parity drift at v%d transition %d exceeds tol=%.3f "
+                              "— monitor parity_max_diff for growth", self.version, i, tol)
+                diff = max(abs(a - b) for a, b in zip(forward_lps, tr.logprobs))
+                worst = max(worst, diff)
+                log.info("parity check %d/%d v%d max_diff=%.4f",
+                         i + 1, len(candidates), self.version, diff)
         self.model.train()
+        return worst
 
     # -- one GRPO step on one group ------------------------------------------
 
     def train_on_group(self, group: list[Trajectory]) -> dict:
         transitions, advs = flatten_group(group)
 
-        if self.version == 0:
-            self.parity_check(transitions)
+        # Every step, not just step 0: verifies the trainer's forward pass
+        # still reproduces vLLM's sampling logprobs for current-version
+        # transitions (strict abort at v0, warn at v>0 — see parity_check).
+        parity_max_diff = self.parity_check(transitions)
 
         batch = collate_transitions(
             transitions, advs, self.tokenizer.pad_token_id or 0,
@@ -311,6 +333,7 @@ class GRPOTrainer:
         # estimates toward short episodes. Alert if this climbs above ~10%.
         total_metrics["n_transitions"] = len(transitions)
         total_metrics["n_skipped_overlong"] = len(transitions) - B
+        total_metrics["parity_max_diff"] = parity_max_diff
         return total_metrics
 
     # -- weight sync -----------------------------------------------------------
@@ -326,6 +349,7 @@ class GRPOTrainer:
         """
         import httpx
 
+        prev = f"policy_v{self.version}" if self.version > 0 else None
         candidate = self.version + 1
         name = f"policy_v{candidate}"
         path = os.path.abspath(os.path.join(self.cfg.adapter_dir, name))
@@ -338,4 +362,21 @@ class GRPOTrainer:
         r.raise_for_status()          # raises on failure; version NOT bumped yet
         self.version = candidate      # commit only after vLLM confirms load
         log.info("loaded %s into vLLM", name)
+
+        # Unload the superseded adapter so registrations don't accumulate
+        # across a long run (30+ adapters risks hitting vLLM's LoRA slot
+        # limits mid-run, which would strand training on a stale policy).
+        # Best-effort: the proxy already routes new requests to the new name;
+        # an in-flight request on the old adapter may fail and be retried by
+        # the driver's rollout hygiene.
+        if prev:
+            try:
+                httpx.post(
+                    f"{self.cfg.vllm_base_url}/v1/unload_lora_adapter",
+                    json={"lora_name": prev},
+                    timeout=30,
+                ).raise_for_status()
+                log.info("unloaded %s", prev)
+            except Exception as exc:
+                log.warning("could not unload %s (continuing): %s", prev, exc)
         return name
