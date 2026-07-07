@@ -289,12 +289,21 @@ def main() -> None:
         with open(args.metrics_path, "a") as f:
             f.write(json.dumps(record) + "\n")
 
-    tasks = get_tasks("retail")
+    all_tasks = get_tasks("retail")
+    # Deterministic rewards only: tasks with nl_assertions are scored by an
+    # LLM judge (tau2 default: GPT-4.1) at reward time. Training against a
+    # judge couples the reward signal to another model's quirks and costs an
+    # API call per episode — excluded until we deliberately opt in.
+    tasks = [
+        t for t in all_tasks
+        if not getattr(t.evaluation_criteria, "nl_assertions", None)
+    ]
     if args.holdout_every > 0:
         train_tasks, eval_tasks = split_tasks(tasks, args.holdout_every)
     else:
         train_tasks, eval_tasks = list(tasks), []
-    print(f"loaded {len(tasks)} retail tasks: "
+    print(f"loaded {len(all_tasks)} retail tasks; "
+          f"{len(all_tasks) - len(tasks)} excluded (LLM-judged nl_assertions); "
           f"{len(train_tasks)} train, {len(eval_tasks)} eval")
 
     def maybe_eval(rnd: int) -> None:
