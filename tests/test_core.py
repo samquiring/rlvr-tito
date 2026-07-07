@@ -9,7 +9,7 @@ import torch
 
 from rlvr_tito.grpo import group_advantages, grpo_loss, gather_logprobs
 from rlvr_tito.store import GroupStore, Transition
-from rlvr_tito.trainer import collate_transitions, flatten_group, _check_parity_match
+from rlvr_tito.trainer import collate_transitions, flatten_group
 
 
 def test_group_advantages():
@@ -207,24 +207,19 @@ def test_microbatch_gradient_equals_full_batch():
     )
 
 
-def test_parity_check_passes_within_tolerance():
-    _check_parity_match([-1.01, -2.005], [-1.0, -2.0], tol=0.05, idx=0)
-
-
-def test_parity_check_detects_logprob_drift():
-    try:
-        _check_parity_match([-1.0, -2.0], [-1.5, -2.5], tol=0.05, idx=0)
-        raise AssertionError("should have raised")
-    except RuntimeError as e:
-        assert "drift" in str(e).lower() or "drifted" in str(e).lower()
-
-
-def test_parity_check_detects_length_mismatch():
-    try:
-        _check_parity_match([-1.0, -2.0], [-1.0], tol=0.05, idx=1)
-        raise AssertionError("should have raised")
-    except RuntimeError as e:
-        assert "length mismatch" in str(e).lower()
+def test_collation_carries_adapter_versions():
+    """adapter_versions must stay row-aligned with input_ids after collation
+    skips overlong transitions — the behavior-logprob recompute uses them to
+    decide which rows the trainer's current weights can legitimately rescore."""
+    trs = [
+        Transition([1, 2], [3], [-0.1], adapter_version=0),
+        Transition(list(range(100)), [3], [-0.1] * 1, adapter_version=1),  # skipped
+        Transition([4], [5, 6], [-0.2, -0.3], adapter_version=2),
+    ]
+    batch = collate_transitions(trs, [1.0, 1.0, -1.0], pad_token_id=0, max_seq_len=10)
+    assert batch["input_ids"].shape[0] == 2
+    assert batch["adapter_versions"].tolist() == [0, 2]
+    assert batch["advantages"].tolist() == [1.0, -1.0]
 
 
 if __name__ == "__main__":

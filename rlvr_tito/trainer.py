@@ -26,34 +26,6 @@ from .grpo import gather_logprobs, group_advantages, grpo_loss
 from .store import Trajectory, Transition
 
 
-def _check_parity_match(
-    forward_lps: list[float],
-    stored_lps: list[float],
-    tol: float,
-    idx: int,
-) -> None:
-    """Raise RuntimeError if forward and stored logprobs diverge beyond tol.
-
-    Pure function so it can be unit-tested without a real model.
-    Called by GRPOTrainer.parity_check before the first gradient step.
-    """
-    if len(forward_lps) != len(stored_lps):
-        raise RuntimeError(
-            f"Parity check transition {idx}: length mismatch — "
-            f"forward={len(forward_lps)}, stored={len(stored_lps)}. "
-            "prompt_token_ids has the wrong length."
-        )
-    max_diff = max(abs(a - b) for a, b in zip(forward_lps, stored_lps))
-    if max_diff > tol:
-        raise RuntimeError(
-            f"Parity check transition {idx}: max |forward − stored| = "
-            f"{max_diff:.4f} > {tol}. "
-            f"forward[:5]={[f'{x:.3f}' for x in forward_lps[:5]]} "
-            f"stored[:5]={[f'{x:.3f}' for x in stored_lps[:5]]}. "
-            "Prompt reconstruction or logprob capture has drifted — "
-            "importance ratios will be garbage. Aborting before first step."
-        )
-
 log = logging.getLogger("rlvr_tito.trainer")
 
 
@@ -126,7 +98,7 @@ def collate_transitions(
     gradient. No re-tokenization happens anywhere in this function: ids in,
     ids out.
     """
-    rows, resp_masks, behav_lps, advs = [], [], [], []
+    rows, resp_masks, behav_lps, advs, versions = [], [], [], [], []
     for tr, adv in zip(transitions, advantages):
         ids = tr.prompt_token_ids + tr.response_token_ids
         if len(ids) > max_seq_len:
@@ -150,6 +122,7 @@ def collate_transitions(
         resp_masks.append(mask)
         behav_lps.append(lp)
         advs.append(adv)
+        versions.append(tr.adapter_version)
 
     if not rows:
         return {}
@@ -164,6 +137,7 @@ def collate_transitions(
         "response_mask": pad(resp_masks, 0.0).float(),
         "behavior_logprobs": pad(behav_lps, 0.0).float(),
         "advantages": torch.tensor(advs, dtype=torch.float32),
+        "adapter_versions": torch.tensor(versions, dtype=torch.long),
     }
 
 
@@ -203,74 +177,79 @@ class GRPOTrainer:
         self.opt = torch.optim.AdamW(
             (p for p in self.model.parameters() if p.requires_grad), lr=cfg.lr)
 
-    # -- on-policy parity gate -----------------------------------------------
+    # -- one GRPO step on one group ------------------------------------------
 
-    def parity_check(
-        self, transitions: list[Transition], tol: float = 0.05, n: int = 3
-    ) -> float:
-        """Compare trainer forward-pass logprobs to stored behavior logprobs.
+    def _recompute_behavior_logprobs(self, batch: dict) -> dict:
+        """Replace stored (vLLM) behavior logprobs with the trainer's own
+        forward-pass logprobs for current-version rows, in place.
 
-        Checks transitions whose adapter_version == self.version: at the time
-        train_on_group runs, the trainer's LoRA weights ARE that policy (the
-        step for this group hasn't happened yet), so its forward pass should
-        reproduce vLLM's sampling logprobs. At version 0 this proves the token
-        capture path (LoRA B-matrices are zero, trainer == base model) and any
-        mismatch ABORTS — wrong prompt ids make every importance ratio garbage.
-        At version > 0 a mismatch is logged as an error but does not abort:
-        vLLM's LoRA kernels (Punica) and PEFT's differ numerically, and a
-        spurious kill at step 20 costs more than a loud warning. Watch the
-        returned/logged parity_max_diff metric — sustained growth means real
-        drift, not kernel noise.
+        For transitions whose adapter_version == self.version, the trainer's
+        weights ARE the sampling policy right now (the step for this group
+        hasn't happened yet), so recomputing makes the importance ratio start
+        at exactly 1 by construction. This removes the numeric bias between
+        vLLM's fused hybrid-Mamba kernels and the trainer's torch path —
+        measured at median 1e-4 but with a long tail (p99 ≈ 0.07, max ≈ 0.32
+        nats on real episodes), which would otherwise leak into gradients as
+        up-to-35% ratio errors on tail tokens.
 
-        Returns the max |forward − stored| over checked transitions (0.0 if
-        nothing was checkable).
+        The stored vLLM logprobs are demoted to a capture-sanity check: the
+        MEDIAN |recomputed − stored| over response tokens must stay tiny.
+        Kernel noise never moves the median; a wrong prompt reconstruction
+        moves every token — so a median above tol means the capture path is
+        broken and training must stop. Stale-version rows (sampled under an
+        older adapter we no longer have loaded) keep their stored logprobs:
+        the tail bias there is bounded by PPO clipping.
+
+        Returns parity stats for step metrics.
         """
-        candidates = [t for t in transitions if t.adapter_version == self.version][:n]
-        if not candidates:
-            log.warning("parity_check: no version-%d transitions; skipping",
-                        self.version)
-            return 0.0
-
-        strict = self.version == 0
-        worst = 0.0
+        B = batch["input_ids"].shape[0]
+        mb = self.cfg.micro_batch_size
+        diffs: list[torch.Tensor] = []
+        n_rows = 0
         self.model.eval()
         with torch.no_grad():
-            for i, tr in enumerate(candidates):
-                ids = torch.tensor(
-                    [tr.prompt_token_ids + tr.response_token_ids],
-                    dtype=torch.long,
-                    device=self.cfg.device,
-                )
-                logits = self.model(input_ids=ids).logits
-                logp = gather_logprobs(logits[:, :-1], ids[:, 1:])
-                # Response token logprobs in the causal-shifted view start at
-                # position prompt_len-1 (predicting ids[prompt_len]).
-                p = len(tr.prompt_token_ids)
-                forward_lps = logp[0, p - 1 : p - 1 + len(tr.response_token_ids)].tolist()
-                try:
-                    _check_parity_match(forward_lps, list(tr.logprobs), tol, i)
-                except RuntimeError:
-                    if strict:
-                        self.model.train()
-                        raise
-                    log.error("parity drift at v%d transition %d exceeds tol=%.3f "
-                              "— monitor parity_max_diff for growth", self.version, i, tol)
-                diff = max(abs(a - b) for a, b in zip(forward_lps, tr.logprobs))
-                worst = max(worst, diff)
-                log.info("parity check %d/%d v%d max_diff=%.4f",
-                         i + 1, len(candidates), self.version, diff)
+            for i in range(0, B, mb):
+                sl = slice(i, i + mb)
+                if not (batch["adapter_versions"][sl] == self.version).all():
+                    # mb=1 in practice, so a micro-batch is one row; skip
+                    # stale-version rows entirely rather than masking within.
+                    continue
+                ids = batch["input_ids"][sl].to(self.cfg.device)
+                attn = batch["attention_mask"][sl].to(self.cfg.device)
+                logits = self.model(input_ids=ids, attention_mask=attn).logits
+                logp = gather_logprobs(logits[:, :-1], ids[:, 1:]).float().cpu()
+                rmask = batch["response_mask"][sl][:, 1:].bool()
+                stored = batch["behavior_logprobs"][sl][:, 1:]
+                diffs.append((logp - stored).abs()[rmask])
+                batch["behavior_logprobs"][sl][:, 1:] = torch.where(
+                    rmask, logp, stored)
+                n_rows += ids.shape[0]
         self.model.train()
-        return worst
 
-    # -- one GRPO step on one group ------------------------------------------
+        if not diffs:
+            log.warning("no current-version (v%d) rows to recompute — training "
+                        "entirely on stored vLLM logprobs for this group",
+                        self.version)
+            return {"n_lp_recomputed_rows": 0}
+        d = torch.cat(diffs)
+        stats = {
+            "n_lp_recomputed_rows": n_rows,
+            "parity_median_diff": d.median().item(),
+            "parity_p99_diff": d.quantile(0.99).item() if d.numel() > 1 else d.max().item(),
+            "parity_max_diff": d.max().item(),
+        }
+        if stats["parity_median_diff"] > 0.05:
+            raise RuntimeError(
+                f"Capture-path failure: median |trainer − vLLM| logprob diff = "
+                f"{stats['parity_median_diff']:.4f} > 0.05 across {d.numel()} "
+                "response tokens. Kernel noise never moves the median — the "
+                "prompt reconstruction or logprob capture is broken. Aborting."
+            )
+        log.info("behavior logprobs recomputed for %d rows: %s", n_rows, stats)
+        return stats
 
     def train_on_group(self, group: list[Trajectory]) -> dict:
         transitions, advs = flatten_group(group)
-
-        # Every step, not just step 0: verifies the trainer's forward pass
-        # still reproduces vLLM's sampling logprobs for current-version
-        # transitions (strict abort at v0, warn at v>0 — see parity_check).
-        parity_max_diff = self.parity_check(transitions)
 
         batch = collate_transitions(
             transitions, advs, self.tokenizer.pad_token_id or 0,
@@ -283,6 +262,8 @@ class GRPOTrainer:
             )
             return {"n_transitions": len(transitions),
                     "n_skipped_overlong": len(transitions)}
+
+        parity_stats = self._recompute_behavior_logprobs(batch)
 
         self.model.train()
         self.opt.zero_grad(set_to_none=True)
@@ -333,7 +314,7 @@ class GRPOTrainer:
         # estimates toward short episodes. Alert if this climbs above ~10%.
         total_metrics["n_transitions"] = len(transitions)
         total_metrics["n_skipped_overlong"] = len(transitions) - B
-        total_metrics["parity_max_diff"] = parity_max_diff
+        total_metrics.update(parity_stats)
         return total_metrics
 
     # -- weight sync -----------------------------------------------------------
