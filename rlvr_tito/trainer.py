@@ -179,6 +179,25 @@ class GRPOTrainer:
 
     # -- one GRPO step on one group ------------------------------------------
 
+    def _forward_response_logprobs(
+        self, ids_row: torch.Tensor, resp_len: int
+    ) -> torch.Tensor:
+        """Forward one unpadded row; return (1, resp_len) logprobs of its last
+        resp_len tokens (the response — always the suffix of a transition).
+
+        Uses logits_to_keep so the LM head runs only over the response suffix.
+        HF upcasts logits to fp32 inside forward, so materializing them for a
+        full 20k-token prompt is ~12 GiB and OOMs the GPU shared with vLLM —
+        prompt positions carry no gradient and their logits are pure waste.
+        """
+        L = ids_row.shape[1]
+        assert 0 < resp_len < L, f"resp_len={resp_len} must be in (0, {L})"
+        out = self.model(input_ids=ids_row, logits_to_keep=resp_len + 1)
+        # logits cover positions L-resp_len-1 .. L-1; logits[t] predicts
+        # token t+1, so dropping the last logit aligns them with the last
+        # resp_len tokens as labels.
+        return gather_logprobs(out.logits[:, :-1], ids_row[:, -resp_len:])
+
     def _recompute_behavior_logprobs(self, batch: dict) -> dict:
         """Replace stored (vLLM) behavior logprobs with the trainer's own
         forward-pass logprobs for current-version rows, in place.
@@ -202,28 +221,28 @@ class GRPOTrainer:
 
         Returns parity stats for step metrics.
         """
+        if self.cfg.micro_batch_size != 1:
+            raise NotImplementedError(
+                "response-suffix forwards assume one unpadded row per forward; "
+                "micro_batch_size must stay 1 (required for Mamba anyway)")
         B = batch["input_ids"].shape[0]
-        mb = self.cfg.micro_batch_size
         diffs: list[torch.Tensor] = []
         n_rows = 0
         self.model.eval()
         with torch.no_grad():
-            for i in range(0, B, mb):
-                sl = slice(i, i + mb)
-                if not (batch["adapter_versions"][sl] == self.version).all():
-                    # mb=1 in practice, so a micro-batch is one row; skip
-                    # stale-version rows entirely rather than masking within.
+            for i in range(B):
+                if int(batch["adapter_versions"][i]) != self.version:
                     continue
-                ids = batch["input_ids"][sl].to(self.cfg.device)
-                attn = batch["attention_mask"][sl].to(self.cfg.device)
-                logits = self.model(input_ids=ids, attention_mask=attn).logits
-                logp = gather_logprobs(logits[:, :-1], ids[:, 1:]).float().cpu()
-                rmask = batch["response_mask"][sl][:, 1:].bool()
-                stored = batch["behavior_logprobs"][sl][:, 1:]
-                diffs.append((logp - stored).abs()[rmask])
-                batch["behavior_logprobs"][sl][:, 1:] = torch.where(
-                    rmask, logp, stored)
-                n_rows += ids.shape[0]
+                true_len = int(batch["attention_mask"][i].sum())
+                resp_len = int(batch["response_mask"][i].sum())
+                p = true_len - resp_len  # prompt length
+                ids_row = batch["input_ids"][i : i + 1, :true_len].to(self.cfg.device)
+                lp = self._forward_response_logprobs(ids_row, resp_len).float().cpu()
+                # Full-layout behavior slot for response token j is p + j.
+                stored = batch["behavior_logprobs"][i, p : p + resp_len]
+                diffs.append((lp[0] - stored).abs())
+                batch["behavior_logprobs"][i, p : p + resp_len] = lp[0]
+                n_rows += 1
         self.model.train()
 
         if not diffs:
@@ -268,41 +287,37 @@ class GRPOTrainer:
         self.model.train()
         self.opt.zero_grad(set_to_none=True)
         B = batch["input_ids"].shape[0]
-        mb = self.cfg.micro_batch_size
         total_metrics: dict = {}
 
-        # Global token count over the full batch (same causal shift as grpo_loss).
-        # Computed once here so each micro-batch's backward contributes
-        # (local_pg_sum / global_tokens) — a true token-mean over all samples.
-        # Scaling a local token-mean by (local_samples / B) instead would mix
-        # per-token means with sample fractions, making the effective per-token
-        # weight depend on micro-batch size.
-        global_tokens = float(batch["response_mask"][:, 1:].sum().clamp(min=1))
+        # Global token count over the full batch. Each row's backward
+        # contributes (local_pg_sum / global_tokens) so the accumulated
+        # gradient is a true token-mean over all transitions in the group —
+        # scaling a local token-mean by sample fractions instead would make
+        # each token's weight depend on which row it sits in.
+        global_tokens = float(batch["response_mask"].sum().clamp(min=1))
 
-        for i in range(0, B, mb):
-            sl = slice(i, i + mb)
-            ids = batch["input_ids"][sl].to(self.cfg.device)
-            attn = batch["attention_mask"][sl].to(self.cfg.device)
-            rmask = batch["response_mask"][sl].to(self.cfg.device)
-            blp = batch["behavior_logprobs"][sl].to(self.cfg.device)
-            adv = batch["advantages"][sl].to(self.cfg.device)
-
-            # Standard causal shift: logits at t predict token t+1.
-            logits = self.model(input_ids=ids, attention_mask=attn).logits
-            logp = gather_logprobs(logits[:, :-1], ids[:, 1:])
+        for i in range(B):
+            true_len = int(batch["attention_mask"][i].sum())
+            resp_len = int(batch["response_mask"][i].sum())
+            p = true_len - resp_len
+            ids_row = batch["input_ids"][i : i + 1, :true_len].to(self.cfg.device)
+            # Response-suffix forward (see _forward_response_logprobs): the
+            # prompt's logits are never materialized. Loss tensors are built
+            # response-only; grpo_loss math is unchanged.
+            logp = self._forward_response_logprobs(ids_row, resp_len)
+            blp = batch["behavior_logprobs"][i : i + 1, p : p + resp_len].to(self.cfg.device)
+            adv = batch["advantages"][i : i + 1].to(self.cfg.device)
             loss, m = grpo_loss(
                 logp_new=logp,
-                logp_behavior=blp[:, 1:],
+                logp_behavior=blp,
                 advantages=adv,
-                response_mask=rmask[:, 1:],
+                response_mask=torch.ones_like(logp),
                 clip_low=self.cfg.clip_low,
                 clip_high=self.cfg.clip_high,
             )
-            # grpo_loss returns a local token-mean; multiply by local token
-            # count to recover the sum, then divide by global_tokens so the
-            # accumulated gradient equals a token-mean over the full batch.
-            local_tokens = float(rmask[:, 1:].sum().clamp(min=1))
-            (loss * (local_tokens / global_tokens)).backward()
+            # grpo_loss returns a local token-mean; recover the sum, then
+            # normalize by the global count for a full-batch token-mean.
+            (loss * (float(resp_len) / global_tokens)).backward()
             total_metrics = m
 
         torch.nn.utils.clip_grad_norm_(
