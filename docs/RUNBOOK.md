@@ -149,6 +149,23 @@ set -a; source /workspace/secrets.env; set +a   # set -a exports; plain source d
   blocks — harmless for text-only training, but check the *language*
   projections did get LoRA-wrapped or hot-swaps silently change nothing.
 
+## Slow ≠ stalled
+
+A GRPO step can take many minutes: ~100 transitions × two forwards each
+(behavior-logprob recompute + gradient pass) at micro-batch 1 on multi-k
+token sequences, sharing the GPU with live vLLM decode. The FIRST step is
+slower still — Triton kernel autotune and torch warmup happen there.
+**Before assuming a stall, check `nvidia-smi`:** utilization pinned near
+100% with the trainer's memory elevated means it is computing. A real
+trainer crash leaves a `_training_loop` traceback in proxy.log; absence of
+step metrics alone proves nothing.
+
+Also note `step` (weights version) vs `served_version` in the metrics: they
+diverge when an adapter push fails — the trainer keeps training while vLLM
+serves the old policy, rollouts stay tagged with the served version, and
+the recompute path automatically treats them as off-policy. A persistent
+gap means pushes keep failing; check vLLM health.
+
 ## Monitoring a run
 
 | Signal | Where | Healthy |

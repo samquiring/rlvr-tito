@@ -243,10 +243,12 @@ def _training_loop():
     if trainer.version > 0:
         # Resumed from a checkpoint: make vLLM serve those weights NOW, or
         # rollouts sample the base model while the trainer holds policy_vN.
+        # register_current_adapter retries with backoff — vLLM may be busy
+        # with rollouts — and raises with guidance if it cannot load.
         state["adapter"] = trainer.register_current_adapter()
-        state["adapter_version"] = trainer.version
+        state["adapter_version"] = trainer.served_version
         log.info("resumed at version %d; serving %s",
-                 trainer.version, state["adapter"])
+                 trainer.served_version, state["adapter"])
     log.info("trainer ready; polling for groups of %d", GROUP_SIZE)
     while True:
         group = store.pop_ready_group()
@@ -254,6 +256,11 @@ def _training_loop():
             time.sleep(2.0)
             continue
         rewards = [t.reward for t in group]
+        log.info(
+            "training on group task=%s (%d trajectories) — a step can take "
+            "many minutes (long sequences at micro-batch 1; first step also "
+            "pays kernel autotune). Check nvidia-smi utilization before "
+            "assuming a stall.", group[0].task_id, len(group))
         metrics = trainer.train_on_group(group)
 
         if metrics.get("oom_skipped_group"):
@@ -266,30 +273,37 @@ def _training_loop():
             continue
 
         # A failed push must not kill the loop: sampling continues on the old
-        # adapter and the importance ratio absorbs the one-step lag. Retry a
-        # few times (vLLM may be busy), then log loudly and move on.
-        adapter = state["adapter"]
+        # adapter and the importance ratio absorbs the lag. Retry a few times
+        # (vLLM may be busy), then log loudly and move on — push_adapter will
+        # publish the newest weights after the next group instead.
         for attempt in range(3):
             try:
-                adapter = trainer.push_adapter()
+                trainer.push_adapter()
                 break
             except Exception as exc:
                 log.error("push_adapter attempt %d failed: %s", attempt + 1, exc)
                 time.sleep(5)
         else:
-            log.error("adapter push failed 3x — still serving %s; will retry "
-                      "after the next group", adapter)
-        state["adapter"] = adapter
-        state["adapter_version"] = trainer.version
+            log.error("adapter push failed 3x — vLLM keeps serving v%d while "
+                      "trainer weights are at v%d; rollouts stay tagged with "
+                      "the served version and the recompute path treats them "
+                      "as off-policy", trainer.served_version, trainer.version)
+        # Report what is actually SERVED, not what the trainer holds — these
+        # differ after a failed push, and tagging transitions with the
+        # trainer's weights version would corrupt recompute eligibility.
+        state["adapter"] = (f"policy_v{trainer.served_version}"
+                            if trainer.served_version > 0 else None)
+        state["adapter_version"] = trainer.served_version
         state["last_step_metrics"] = metrics
 
         record = {
             "ts": time.time(),
             "step": trainer.version,
+            "served_version": trainer.served_version,
             "task_id": group[0].task_id,
             "rewards": rewards,
             "reward_mean": sum(rewards) / len(rewards),
-            "adapter": adapter,
+            "adapter": state["adapter"],
             **metrics,
         }
         _append_metrics(record)

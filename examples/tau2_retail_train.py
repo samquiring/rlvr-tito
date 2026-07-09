@@ -66,8 +66,14 @@ from tau2.runner.simulation import run_simulation  # noqa: E402
 # ── defaults from environment ──────────────────────────────────────────────
 _PROXY_DEFAULT = os.environ.get("PROXY_URL", "http://localhost:9000")
 _MODEL_DEFAULT = os.environ.get("MODEL", "Qwen/Qwen3.5-4B")
-_ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+# The user simulator goes through litellm, so any provider path works:
+# "claude-haiku-4-5-20251001", "huggingface/<org>/<model>", "openai/gpt-4.1",
+# "openrouter/...", etc. Credentials resolve the litellm way — from the
+# provider's standard env var (ANTHROPIC_API_KEY, HF_TOKEN, OPENAI_API_KEY,
+# ...) — or explicitly via USER_SIM_API_KEY / --user-api-key.
 _USER_MODEL = os.environ.get("USER_SIM_MODEL", "claude-haiku-4-5-20251001")
+_USER_API_KEY = os.environ.get("USER_SIM_API_KEY",
+                               os.environ.get("ANTHROPIC_API_KEY", ""))
 
 
 class RolloutError(RuntimeError):
@@ -80,16 +86,23 @@ def _one_rollout(
     task,
     proxy_url: str,
     model: str,
-    anthropic_api_key: str,
+    user_api_key: str,
     seed: int,
     record: bool = True,
     max_steps: int = 200,
+    user_model: str = _USER_MODEL,
 ) -> float:
     """Run one tau2 retail episode; return the composite reward.
 
     record=True registers a trajectory with the proxy so agent tokens are
     captured for training. record=False runs a pure eval episode: no
     X-Trajectory-ID header, so the proxy forwards without storing anything.
+
+    Context overflow (the agent's conversation exceeding the model's window)
+    is scored as a FAILED episode (reward 0.0), not an infra error: it is a
+    deterministic consequence of the policy's verbosity on that task, so
+    retrying would overflow again and trip the infrastructure-abort. The
+    no-success group filter keeps all-overflow groups out of training.
     """
     traj_id: str | None = None
     extra_headers: dict[str, str] = {}
@@ -114,8 +127,10 @@ def _one_rollout(
             "api_key": "EMPTY",
             "extra_headers": extra_headers,
         },
-        llm_user=_USER_MODEL,
-        llm_args_user={"api_key": anthropic_api_key},
+        llm_user=user_model,
+        # litellm resolves credentials from provider env vars when api_key is
+        # absent — only pass one if explicitly configured.
+        llm_args_user={"api_key": user_api_key} if user_api_key else {},
         # Pinned explicitly: tau2 has BOTH a 200-turn config default and a
         # 100-step orchestrator fallback depending on entry point. Episodes
         # truncated by a low cap get judged as failures — reward says the
@@ -128,6 +143,16 @@ def _one_rollout(
         orchestrator = build_text_orchestrator(config, task, seed=seed)
         result = run_simulation(orchestrator)
     except Exception as exc:
+        # Context overflow is a policy outcome, not an infrastructure error:
+        # score the episode as failed rather than aborting, or the retry
+        # loop deterministically re-overflows and kills the whole run.
+        if "maximum context length" in str(exc).lower():
+            print(f"  context overflow on task {task.id} seed {seed} — "
+                  "scoring episode as failed (0.0)")
+            if traj_id:
+                httpx.post(f"{proxy_url}/trajectories/{traj_id}/reward",
+                           json={"reward": 0.0}, timeout=30).raise_for_status()
+            return 0.0
         # Infra failure mid-episode: discard the partial trajectory so it can
         # never enter a training group with a bogus reward.
         if traj_id:
@@ -156,12 +181,13 @@ def run_task_group(
     task,
     proxy_url: str,
     model: str,
-    anthropic_api_key: str,
+    user_api_key: str,
     group_size: int,
     workers: int,
     base_seed: int,
     max_retries: int = 2,
     max_steps: int = 200,
+    user_model: str = _USER_MODEL,
 ) -> tuple[list[float], int]:
     """Run GROUP_SIZE successful rollouts for one task in parallel.
 
@@ -175,7 +201,8 @@ def run_task_group(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = {
             pool.submit(_one_rollout, task, proxy_url, model,
-                        anthropic_api_key, base_seed + i, True, max_steps): 0
+                        user_api_key, base_seed + i, True, max_steps,
+                        user_model): 0
             for i in range(group_size)
         }
         retry_seed = base_seed + group_size  # fresh seeds for retries
@@ -197,7 +224,8 @@ def run_task_group(
                     ) from exc
                 pending[pool.submit(
                     _one_rollout, task, proxy_url, model,
-                    anthropic_api_key, retry_seed, True, max_steps)] = attempt + 1
+                    user_api_key, retry_seed, True, max_steps,
+                    user_model)] = attempt + 1
                 retry_seed += 1
     return rewards, n_failures
 
@@ -208,11 +236,12 @@ def run_eval(
     tasks,
     proxy_url: str,
     model: str,
-    anthropic_api_key: str,
+    user_api_key: str,
     workers: int,
     seed: int,
     rollouts_per_task: int = 1,
     max_steps: int = 200,
+    user_model: str = _USER_MODEL,
 ) -> dict:
     """Run held-out tasks without trajectory recording; return reward summary."""
     results: dict[str, list[float]] = {}
@@ -221,7 +250,8 @@ def run_eval(
         for task in tasks:
             for i in range(rollouts_per_task):
                 f = pool.submit(_one_rollout, task, proxy_url, model,
-                                anthropic_api_key, seed + i, False, max_steps)
+                                user_api_key, seed + i, False, max_steps,
+                                user_model)
                 futs[f] = str(task.id)
         for f in as_completed(futs):
             tid = futs[f]
@@ -268,8 +298,15 @@ def main() -> None:
                     help="distinct tasks sampled each round")
     ap.add_argument("--group-size", type=int, default=8,
                     help="rollouts per task (must match proxy GROUP_SIZE)")
-    ap.add_argument("--workers", type=int, default=4,
+    ap.add_argument("--workers", type=int, default=8,
                     help="parallel threads per task group")
+    ap.add_argument("--user-model", default=_USER_MODEL,
+                    help="litellm model string for the user simulator, e.g. "
+                         "claude-haiku-4-5-20251001, huggingface/<org>/<model>, "
+                         "openai/gpt-4.1")
+    ap.add_argument("--user-api-key", default=_USER_API_KEY,
+                    help="API key for the user-sim provider; if omitted, "
+                         "litellm resolves the provider's standard env var")
     ap.add_argument("--seed", type=int, default=0, help="base random seed")
     ap.add_argument("--max-retries", type=int, default=2,
                     help="retries per failed rollout before declaring infra down")
@@ -288,8 +325,9 @@ def main() -> None:
                          "is already recorded under the same reward config)")
     args = ap.parse_args()
 
-    if not _ANTHROPIC_KEY:
-        sys.exit("ANTHROPIC_API_KEY not set — needed for the tau2 user simulator")
+    if not args.user_api_key:
+        print(f"note: no explicit user-sim API key; litellm will resolve "
+              f"credentials for {args.user_model!r} from provider env vars")
 
     # Verify proxy is up
     try:
@@ -326,9 +364,10 @@ def main() -> None:
         if rnd % args.eval_every != 0:
             return
         print(f"── eval @ round {rnd} ({len(eval_tasks)} held-out tasks) ──")
-        ev = run_eval(eval_tasks, args.proxy, args.model, _ANTHROPIC_KEY,
-                      args.workers, args.seed + 90_000 + rnd,
-                      args.eval_rollouts, args.max_steps)
+        ev = run_eval(eval_tasks, args.proxy, args.model,
+                      args.user_api_key, args.workers,
+                      args.seed + 90_000 + rnd,
+                      args.eval_rollouts, args.max_steps, args.user_model)
         adapter = httpx.get(f"{args.proxy}/stats", timeout=10).json().get("adapter")
         print(f"eval @ round {rnd}: reward_mean={ev['reward_mean']:.3f} "
               f"({ev['n_completed']} episodes, adapter={adapter})")
@@ -351,12 +390,13 @@ def main() -> None:
                 task=task,
                 proxy_url=args.proxy,
                 model=args.model,
-                anthropic_api_key=_ANTHROPIC_KEY,
+                user_api_key=args.user_api_key,
                 group_size=args.group_size,
                 workers=args.workers,
                 base_seed=base_seed,
                 max_retries=args.max_retries,
                 max_steps=args.max_steps,
+                user_model=args.user_model,
             )
             mean_r = sum(rewards) / len(rewards)
             round_rewards.extend(rewards)

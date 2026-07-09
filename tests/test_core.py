@@ -9,7 +9,8 @@ import torch
 
 from rlvr_tito.grpo import group_advantages, grpo_loss, gather_logprobs
 from rlvr_tito.store import GroupStore, Transition
-from rlvr_tito.trainer import collate_transitions, flatten_group
+from rlvr_tito.trainer import (
+    aggregate_step_metrics, collate_transitions, flatten_group)
 
 
 def test_group_advantages():
@@ -244,6 +245,24 @@ def test_gather_logprobs_chunked_matches_direct():
     direct.sum().backward()
     chunked.sum().backward()
     assert torch.allclose(logits_a.grad, logits_b.grad, atol=1e-6)
+
+
+def test_step_metrics_are_token_weighted_across_rows():
+    """Step metrics must aggregate over the whole group, token-weighted —
+    previously the last row's dict was reported as-is, so a short final
+    transition could show clip_frac 0.0 while the group clipped heavily."""
+    rows = [
+        ({"loss": 1.0, "ratio_mean": 1.0, "clip_frac": 1.0,
+          "response_tokens": 90.0}, 90.0),
+        ({"loss": 0.0, "ratio_mean": 2.0, "clip_frac": 0.0,
+          "response_tokens": 10.0}, 10.0),
+    ]
+    agg = aggregate_step_metrics(rows)
+    assert abs(agg["clip_frac"] - 0.9) < 1e-9      # not the last row's 0.0
+    assert abs(agg["loss"] - 0.9) < 1e-9
+    assert abs(agg["ratio_mean"] - 1.1) < 1e-9
+    assert agg["response_tokens"] == 100.0
+    assert aggregate_step_metrics([]) == {}
 
 
 def test_collation_carries_adapter_versions():

@@ -23,7 +23,11 @@
 #
 # Env overrides:
 #   MODEL          served + trained model        (default Qwen/Qwen3.5-4B)
-#   GPU_UTIL       vLLM --gpu-memory-utilization (default 0.50)
+#   GPU_UTIL       vLLM --gpu-memory-utilization (default 0.55). When vLLM
+#                  and the trainer are CO-LOCATED on one GPU this must stay
+#                  ~0.55, NOT vLLM's usual 0.85-0.9 — the trainer needs the
+#                  rest for weights, optimizer, and long-sequence backwards.
+#                  Only raise it when the trainer has its own GPU.
 #   GROUP_SIZE     GRPO group size               (default 8)
 #   ENFORCE_EAGER  1 = skip torch.compile/CUDA graphs. Slower decode but
 #                  removes the init memory spike and ~5 min of startup;
@@ -40,7 +44,7 @@
 set -euo pipefail
 
 MODEL="${MODEL:-Qwen/Qwen3.5-4B}"
-GPU_UTIL="${GPU_UTIL:-0.50}"
+GPU_UTIL="${GPU_UTIL:-0.55}"
 GROUP_SIZE="${GROUP_SIZE:-8}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-1}"
 TOOL_PARSER="${TOOL_PARSER:-qwen3_xml}"
