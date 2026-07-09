@@ -155,6 +155,27 @@ def test_group_store_drops_degenerate():
     assert s.stats["groups_dropped_degenerate"] == 1
 
 
+def test_group_store_drops_no_success_groups():
+    """[0, -1] has reward variance so it survives the degenerate filter, but
+    mean-only advantages would give the 0-reward failure POSITIVE advantage
+    (it beats the -1 outlier) — training toward least-bad failures is a
+    policy-collapse vector. Groups with max reward <= 0 must never train."""
+    s = GroupStore(group_size=2)
+    for r in (0.0, -1.0):
+        tid = s.start_trajectory("A")
+        s.record(tid, Transition([1], [2], [-0.1], 0))
+        s.complete(tid, r)
+    assert s.pop_ready_group() is None
+    assert s.stats["groups_dropped_no_success"] == 1
+    # a group containing a real success still trains, even with a -1 in it
+    for r in (1.0, -1.0):
+        tid = s.start_trajectory("B")
+        s.record(tid, Transition([1], [2], [-0.1], 0))
+        s.complete(tid, r)
+    group = s.pop_ready_group()
+    assert group is not None and {t.reward for t in group} == {1.0, -1.0}
+
+
 def test_flatten_group_broadcasts_advantage():
     from rlvr_tito.store import Trajectory
     t_win = Trajectory("w", "A", [Transition([1], [2], [-0.1], 0)] * 3, reward=1.0)

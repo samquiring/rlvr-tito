@@ -61,14 +61,17 @@ class GroupStore:
     """Thread-safe store keyed by task_id. A group becomes trainable when
     group_size completed trajectories of the same task exist."""
 
-    def __init__(self, group_size: int = 8, drop_degenerate: bool = True):
+    def __init__(self, group_size: int = 8, drop_degenerate: bool = True,
+                 drop_no_success: bool = True):
         self.group_size = group_size
         self.drop_degenerate = drop_degenerate
+        self.drop_no_success = drop_no_success
         self._traj: dict[str, Trajectory] = {}
         self._completed: dict[str, list[Trajectory]] = {}
         self._lock = threading.Lock()
         self.stats = {"trajectories": 0, "transitions": 0, "aborted": 0,
-                      "groups_ready": 0, "groups_dropped_degenerate": 0}
+                      "groups_ready": 0, "groups_dropped_degenerate": 0,
+                      "groups_dropped_no_success": 0}
 
     # -- rollout-time API (called by the proxy) ------------------------------
 
@@ -116,8 +119,17 @@ class GroupStore:
 
     def pop_ready_group(self) -> list[Trajectory] | None:
         """Return one full group of completed trajectories, or None.
-        Degenerate groups (all rewards identical -> zero advantage everywhere)
-        are dropped and counted, DAPO dynamic-sampling style."""
+
+        Two filters, both counted in stats:
+        - Degenerate groups (all rewards identical -> zero advantage
+          everywhere) are dropped, DAPO dynamic-sampling style.
+        - No-success groups (max reward <= 0) are dropped. With mean-only
+          advantages, a group like [0,0,0,0,-1] gives the zeros POSITIVE
+          advantage — the policy gets pushed toward complete failures merely
+          because they beat a worse outlier (an errored/overflowed episode).
+          Relative advantage only defines a meaningful "toward" when at least
+          one trajectory in the group actually succeeded; training on
+          least-bad-failure gradients is a policy-collapse vector."""
         with self._lock:
             for task_id, done in list(self._completed.items()):
                 if len(done) < self.group_size:
@@ -127,6 +139,9 @@ class GroupStore:
                 rewards = {t.reward for t in group}
                 if self.drop_degenerate and len(rewards) == 1:
                     self.stats["groups_dropped_degenerate"] += 1
+                    continue
+                if self.drop_no_success and max(rewards) <= 0.0:
+                    self.stats["groups_dropped_no_success"] += 1
                     continue
                 self.stats["groups_ready"] += 1
                 return group
